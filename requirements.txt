@@ -1,0 +1,17 @@
+transformers>=4.56,<5
+accelerate
+deepspeed
+datasets
+huggingface_hub
+safetensors
+tokenizers
+sentencepiece
+protobuf
+numpy
+tqdm
+psutil
+pyyaml
+tensorboard
+packaging
+ninja
+peft

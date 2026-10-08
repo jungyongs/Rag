@@ -1,0 +1,33 @@
+name: qwen3_8b
+model_path: models/Qwen3-8B-Base
+cache_path: data/cache/qwen3_8b_seq2048
+output_dir: outputs/qwen3_8b
+deepspeed_config: configs/deepspeed/zero2.json
+
+data_path: data/raw/dummy_1gb.txt
+file_pattern: "**/*.txt"
+seq_len: 2048
+shuffle_documents: true
+data_seed: 42
+add_eos_between_documents: true
+tokenize_chunk_chars: 1000000
+
+micro_batch_size: 1
+gradient_accumulation_steps: 1
+
+bf16: true
+tf32: true
+gradient_checkpointing: true
+
+learning_rate: 1.0e-5
+weight_decay: 0.1
+
+max_steps: -1
+num_train_epochs: 1.0
+benchmark_warmup_steps: 20
+logging_steps: 10
+dataloader_num_workers: 4
+seed: 42
+
+attn_implementation: flash_attention_2
+

@@ -1,0 +1,11 @@
+{
+  "signature": "fe70027360ac6ad90061412250c01924a625714df937ac0ffb12f870f20ed318",
+  "model_name": "qwen3_8b",
+  "model_path": "/data/jungyongs/rag/models/Qwen3-8B-Base",
+  "raw_data_path": "/data/jungyongs/rag/data/raw/dummy_1gb.txt",
+  "num_documents": 1,
+  "seq_len": 2048,
+  "num_sequences": 8464,
+  "total_tokens": 17334272,
+  "preprocessing_seconds": 47.01325090229511
+}

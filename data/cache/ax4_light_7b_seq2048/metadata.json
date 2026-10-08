@@ -1,0 +1,11 @@
+{
+  "signature": "6e9ccc12b21cc85e99e289350d00f4ec59fe15314fb9dda2d41d7ae6b520f7c5",
+  "model_name": "ax4_light_7b",
+  "model_path": "/data/jungyongs/rag/models/AX-4.0-Light",
+  "raw_data_path": "/data/jungyongs/rag/data/raw/dummy_1gb.txt",
+  "num_documents": 1,
+  "seq_len": 2048,
+  "num_sequences": 9083,
+  "total_tokens": 18601984,
+  "preprocessing_seconds": 41.51743830554187
+}

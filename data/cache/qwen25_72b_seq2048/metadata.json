@@ -1,0 +1,11 @@
+{
+  "signature": "e72a283aa0b4001c6acb7e2f3ac6c69d248a84ac9bbbd9074dbf822ab523f284",
+  "model_name": "qwen25_72b_lora",
+  "model_path": "/data/jungyongs/rag/models/Qwen2.5-72B",
+  "raw_data_path": "/data/jungyongs/rag/data/raw/dummy_1gb.txt",
+  "num_documents": 1,
+  "seq_len": 32,
+  "num_sequences": 541729,
+  "total_tokens": 17335328,
+  "preprocessing_seconds": 58.53158498369157
+}
