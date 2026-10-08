@@ -17,10 +17,10 @@ GPU_LIST="$3"
 DS_OVERRIDE="${4:-}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CONFIG="${ROOT}/configs/models/${MODEL_KEY}.yaml"
+CONFIG="${CONFIG:-${ROOT}/config.yaml}"
 
 if [[ ! -f "$CONFIG" ]]; then
-  echo "Model config not found: $CONFIG"
+  echo "Config not found: $CONFIG"
   exit 1
 fi
 
@@ -38,6 +38,7 @@ CMD=(
   --nproc_per_node="$NUM_GPUS"
   "${ROOT}/src/train_benchmark.py"
   --config "$CONFIG"
+  --model "$MODEL_KEY"
   --attn_implementation "$ATTN"
 )
 

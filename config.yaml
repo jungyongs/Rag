@@ -1,0 +1,126 @@
+# =====================================================================
+# Central configuration for the whole project.
+#
+# - All relative paths are resolved against the project root.
+# - Each entry under `models` is merged on top of `defaults`
+#   (model-specific values win).
+# - Used by:
+#     src/train_benchmark.py      (--model <key>)
+#     scripts/download_models.py  (--model <key>|all)
+#     scripts/run_benchmark*.sh   (<model_key>)
+#     make_dummy_1gb.py
+# =====================================================================
+
+# ---------------------------------------------------------------------
+# Dummy corpus generation (make_dummy_1gb.py)
+# ---------------------------------------------------------------------
+dummy_data:
+  output_path: data/raw/dummy_1gb.txt
+  target_mib: 100
+  block_mib: 8
+
+# ---------------------------------------------------------------------
+# Defaults shared by every model
+# ---------------------------------------------------------------------
+defaults:
+  # Data / tokenization cache
+  data_path: data/raw/dummy_1gb.txt
+  file_pattern: "**/*.txt"
+  seq_len: 2048
+  shuffle_documents: true
+  data_seed: 42
+  add_eos_between_documents: true
+  tokenize_chunk_chars: 1000000
+  cache_wait_timeout_seconds: 86400
+
+  # Training mode: fft (full fine-tuning) | lora
+  training_mode: fft
+  attn_implementation: flash_attention_2   # sdpa | flash_attention_2
+
+  # Batch
+  micro_batch_size: 1
+  gradient_accumulation_steps: 1
+
+  # Precision / memory
+  bf16: true
+  tf32: true
+  gradient_checkpointing: true
+
+  # Optimizer
+  optim: adamw_torch
+  learning_rate: 1.0e-5
+  weight_decay: 0.1
+
+  # Schedule / logging
+  max_steps: -1
+  num_train_epochs: 1.0
+  benchmark_warmup_steps: 20
+  logging_steps: 10
+  dataloader_num_workers: 4
+  seed: 42
+
+# ---------------------------------------------------------------------
+# Models
+#   repo_id    : Hugging Face repo (used by download_models.py)
+#   model_path : local checkpoint location
+# ---------------------------------------------------------------------
+models:
+  ax4_72b:
+    repo_id: skt/A.X-4.0
+    model_path: models/AX-4.0
+    cache_path: data/cache/ax4_72b_seq2048
+    output_dir: outputs/ax4_72b
+    deepspeed_config: configs/deepspeed/zero3_cpu_offload.json
+
+  ax4_light_7b:
+    repo_id: skt/A.X-4.0-Light
+    model_path: models/AX-4.0-Light
+    cache_path: data/cache/ax4_light_7b_seq2048
+    output_dir: outputs/ax4_light_7b
+    deepspeed_config: configs/deepspeed/zero2.json
+    micro_batch_size: 2
+
+  qwen25_72b:
+    repo_id: Qwen/Qwen2.5-72B
+    model_path: models/Qwen2.5-72B
+    cache_path: data/cache/qwen25_72b_seq2048
+    output_dir: outputs/qwen25_72b
+    deepspeed_config: configs/deepspeed/zero3_cpu_offload.json
+
+  qwen25_72b_lora:
+    repo_id: Qwen/Qwen2.5-72B
+    model_path: models/Qwen2.5-72B
+    cache_path: data/cache/qwen25_72b_seq2048
+    output_dir: outputs/qwen25_72b_lora
+    deepspeed_config: configs/deepspeed/zero3_lora.json
+    training_mode: lora
+    attn_implementation: sdpa
+    seq_len: 32
+    learning_rate: 1.0e-4
+    weight_decay: 0.0
+    lora_r: 16
+    lora_alpha: 32
+    lora_dropout: 0.05
+    lora_bias: none
+    lora_target_modules:
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+
+  qwen3_8b:
+    repo_id: Qwen/Qwen3-8B-Base
+    model_path: models/Qwen3-8B-Base
+    cache_path: data/cache/qwen3_8b_seq2048
+    output_dir: outputs/qwen3_8b
+    deepspeed_config: configs/deepspeed/zero2.json
+
+  apertus_70b:
+    repo_id: EPFLiGHT/Apertus-70B-MeditronFO
+    model_path: models/Apertus-70B-MeditronFO
+    cache_path: data/cache/apertus_70b_seq2048
+    output_dir: outputs/apertus_70b
+    deepspeed_config: configs/deepspeed/zero3_cpu_offload.json

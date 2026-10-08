@@ -1,7 +1,15 @@
 from pathlib import Path
 
-OUT = Path("data/raw/dummy_1gb.txt")
-TARGET_BYTES = 1024 * 1024 * 100  # 100 MiB
+import yaml
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+with (PROJECT_ROOT / "config.yaml").open("r", encoding="utf-8") as f:
+    CFG = yaml.safe_load(f)["dummy_data"]
+
+OUT = PROJECT_ROOT / CFG["output_path"]
+TARGET_BYTES = 1024 * 1024 * int(CFG["target_mib"])
+BLOCK_BYTES = 1024 * 1024 * int(CFG.get("block_mib", 8))
 
 LINE = (
     "The patient presented for follow-up. Clinical history, medications, laboratory findings, "
@@ -11,8 +19,8 @@ LINE = (
 
 OUT.parent.mkdir(parents=True, exist_ok=True)
 
-# Write in ~8 MiB blocks for speed.
-block = LINE * max(1, (8 * 1024 * 1024) // len(LINE))
+# Write in large blocks for speed.
+block = LINE * max(1, BLOCK_BYTES // len(LINE))
 
 written = 0
 with OUT.open("wb") as f:

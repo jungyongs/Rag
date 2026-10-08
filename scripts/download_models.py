@@ -1,6 +1,7 @@
 import argparse
 from pathlib import Path
 
+import yaml
 from huggingface_hub import snapshot_download
 
 
@@ -12,38 +13,25 @@ from huggingface_hub import snapshot_download
 #
 # therefore parents[1] == <PROJECT_ROOT>
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-MODEL_ROOT = PROJECT_ROOT / "models"
+CONFIG_PATH = PROJECT_ROOT / "config.yaml"
 
 
 # ---------------------------------------------------------
-# Model repositories
+# Model repositories (from config.yaml)
 # ---------------------------------------------------------
-MODELS = {
-    "ax4_72b": {
-        "repo_id": "skt/A.X-4.0",
-        "local_name": "AX-4.0",
-    },
+with CONFIG_PATH.open("r", encoding="utf-8") as f:
+    MODELS = {
+        key: info
+        for key, info in yaml.safe_load(f)["models"].items()
+        if info.get("repo_id")
+    }
 
-    "ax4_light_7b": {
-        "repo_id": "skt/A.X-4.0-Light",
-        "local_name": "AX-4.0-Light",
-    },
 
-    "qwen25_72b": {
-        "repo_id": "Qwen/Qwen2.5-72B",
-        "local_name": "Qwen2.5-72B",
-    },
-
-    "qwen3_8b": {
-        "repo_id": "Qwen/Qwen3-8B-Base",
-        "local_name": "Qwen3-8B-Base",
-    },
-
-    "apertus_70b": {
-        "repo_id": "EPFLiGHT/Apertus-70B-MeditronFO",
-        "local_name": "Apertus-70B-MeditronFO",
-    },
-}
+def resolve_path(path_value):
+    p = Path(path_value)
+    if not p.is_absolute():
+        p = PROJECT_ROOT / p
+    return p.resolve()
 
 
 # ---------------------------------------------------------
@@ -52,7 +40,7 @@ MODELS = {
 def download_model(model_key):
     info = MODELS[model_key]
 
-    save_path = MODEL_ROOT / info["local_name"]
+    save_path = resolve_path(info["model_path"])
 
     print()
     print("=" * 70)
@@ -90,10 +78,13 @@ def main():
 
     args = parser.parse_args()
 
-    MODEL_ROOT.mkdir(parents=True, exist_ok=True)
-
     if args.model == "all":
-        for model_key in MODELS:
+        # Several entries (e.g. full + LoRA) can share one checkpoint.
+        seen = set()
+        for model_key, info in MODELS.items():
+            if info["model_path"] in seen:
+                continue
+            seen.add(info["model_path"])
             download_model(model_key)
     else:
         download_model(args.model)

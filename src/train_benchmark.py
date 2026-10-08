@@ -23,6 +23,7 @@ from transformers import (
 from peft import LoraConfig, TaskType, get_peft_model
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_CONFIG = PROJECT_ROOT / "config.yaml"
 
 
 def resolve_path(path_value: str) -> Path:
@@ -35,6 +36,22 @@ def resolve_path(path_value: str) -> Path:
 def load_yaml(path: Path):
     with path.open("r", encoding="utf-8") as f:
         return yaml.safe_load(f)
+
+
+def load_model_config(config_path: Path, model_key: str):
+    """Merge `defaults` with `models.<model_key>` from the central config."""
+    root = load_yaml(config_path)
+    models = root.get("models", {})
+
+    if model_key not in models:
+        raise KeyError(
+            f"Unknown model '{model_key}'. "
+            f"Available: {', '.join(models)}"
+        )
+
+    cfg = {**root.get("defaults", {}), **models[model_key]}
+    cfg["name"] = model_key
+    return cfg
 
 
 def discover_documents(input_path: Path, pattern: str):
@@ -343,7 +360,8 @@ def main():
     parser = argparse.ArgumentParser(
         description="Integrated tokenize/cache + full-parameter DeepSpeed benchmark."
     )
-    parser.add_argument("--config", required=True)
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     parser.add_argument(
         "--attn_implementation",
         choices=["sdpa", "flash_attention_2"],
@@ -364,8 +382,7 @@ def main():
     )
     args = parser.parse_args()
 
-    cfg = load_yaml(resolve_path(args.config))
-    optim=cfg.get("optim", "adamw_torch"),
+    cfg = load_model_config(resolve_path(args.config), args.model)
 
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -429,6 +446,7 @@ def main():
         overwrite_output_dir=True,
         per_device_train_batch_size=micro_batch,
         gradient_accumulation_steps=grad_accum,
+        optim=cfg.get("optim", "adamw_torch"),
         learning_rate=float(cfg.get("learning_rate", 1e-5)),
         weight_decay=float(cfg.get("weight_decay", 0.1)),
         max_steps=max_steps if max_steps > 0 else -1,
@@ -504,7 +522,7 @@ def main():
             r=int(cfg.get("lora_r", 16)),
             lora_alpha=int(cfg.get("lora_alpha", 32)),
             lora_dropout=float(cfg.get("lora_dropout", 0.05)),
-            bias="none",
+            bias=cfg.get("lora_bias", "none"),
             target_modules=cfg.get(
                 "lora_target_modules",
                 [
