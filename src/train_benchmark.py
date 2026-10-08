@@ -4,7 +4,10 @@ import json
 import os
 import random
 import shutil
+import signal
+import subprocess
 import time
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -21,10 +24,14 @@ from transformers import (
     TrainingArguments,
     set_seed,
 )
+from transformers.integrations import is_deepspeed_zero3_enabled
 from peft import LoraConfig, TaskType, get_peft_model
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = PROJECT_ROOT / "config.yaml"
+
+# Written into checkpoint-<step>/ only after every rank finished saving it.
+CHECKPOINT_COMPLETE_MARKER = "_COMPLETE"
 
 
 def resolve_path(path_value: str) -> Path:
@@ -327,20 +334,351 @@ class CausalLMCollator:
         }
 
 
+def list_checkpoints(run_dir: Path):
+    """checkpoint-<step> directories in run_dir, oldest first."""
+    checkpoints = []
+    for p in run_dir.glob("checkpoint-*"):
+        suffix = p.name.split("-", 1)[1]
+        if p.is_dir() and suffix.isdigit():
+            checkpoints.append((int(suffix), p))
+    return [p for _, p in sorted(checkpoints)]
+
+
+def find_resume_checkpoint(run_dir: Path, rank: int):
+    """
+    Return the newest checkpoint that finished saving, or None.
+
+    A checkpoint without the marker was cut off mid-save (e.g. the GPU
+    reservation ended during the save). Rank 0 deletes those so they are
+    not resumed from and do not confuse checkpoint rotation.
+    """
+    latest = None
+    for checkpoint in list_checkpoints(run_dir):
+        if (checkpoint / CHECKPOINT_COMPLETE_MARKER).exists():
+            latest = checkpoint
+        elif rank == 0:
+            print(f"[CKPT] Removing incomplete checkpoint: {checkpoint}")
+            shutil.rmtree(checkpoint, ignore_errors=True)
+    return latest
+
+
+DATA_STATE_FILE = "data_state.json"
+
+# Settings that decide which batch comes next. Trainer resumes the data by
+# replaying the same seeded shuffle and skipping the batches already used,
+# so the data only continues where it stopped if all of these are unchanged.
+DATA_ORDER_KEYS = (
+    "dataset_signature",
+    "num_sequences",
+    "shuffle_documents",
+    "data_seed",
+    "seed",
+    "world_size",
+    "micro_batch_size",
+    "gradient_accumulation_steps",
+)
+
+
+def check_data_state(checkpoint: Path, expected: dict, rank: int):
+    """Refuse to resume if the data order or batch layout has changed."""
+    path = checkpoint / DATA_STATE_FILE
+    if not path.exists():
+        raise RuntimeError(
+            f"{path} is missing, so it cannot be verified that the data "
+            f"continues where it stopped. Use --no_resume to start over."
+        )
+
+    with path.open("r", encoding="utf-8") as f:
+        saved = json.load(f)
+
+    changed = [
+        f"  {key}: checkpoint={saved.get(key)!r} now={expected[key]!r}"
+        for key in DATA_ORDER_KEYS
+        if saved.get(key) != expected[key]
+    ]
+    if changed:
+        raise RuntimeError(
+            "Cannot resume: these settings changed since the checkpoint, so "
+            "the data would not continue where it stopped:\n"
+            + "\n".join(changed)
+            + "\nRestore them, or start over with --no_resume."
+        )
+
+    if rank == 0:
+        print(
+            f"[CKPT] Data resumes after {saved['consumed_sequences']:,} sequences "
+            f"({saved['consumed_tokens']:,} tokens), epoch {saved['epoch']:.4f}"
+        )
+
+
+class CheckpointCompleteMarker(TrainerCallback):
+    """
+    Finish a checkpoint once every rank has written its shard:
+    record the data position, mark it complete, then delete older
+    checkpoints so only the newest `keep` remain.
+
+    Rotation is done here instead of by Trainer (save_total_limit) because
+    Trainer rotates on rank 0 as soon as rank 0 itself is done; with one
+    kept checkpoint it could delete the last good one while other ranks are
+    still writing the new one. The new checkpoint is never written over
+    the old one in place, so a shutdown mid-save always leaves one intact.
+    """
+
+    def __init__(self, keep: int, data_state: dict):
+        self.keep = keep
+        self.data_state = data_state
+
+    def on_save(self, args, state, control, **kwargs):
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+
+        if not state.is_world_process_zero:
+            return
+
+        run_dir = Path(args.output_dir)
+        checkpoint = run_dir / f"checkpoint-{state.global_step}"
+        if not checkpoint.is_dir():
+            return
+
+        sequences_per_step = (
+            self.data_state["world_size"]
+            * self.data_state["micro_batch_size"]
+            * self.data_state["gradient_accumulation_steps"]
+        )
+        consumed = state.global_step * sequences_per_step
+        data_state = {
+            **self.data_state,
+            "global_step": state.global_step,
+            "epoch": state.epoch,
+            "consumed_sequences": consumed,
+            "consumed_tokens": consumed * self.data_state["seq_len"],
+        }
+        with (checkpoint / DATA_STATE_FILE).open("w", encoding="utf-8") as f:
+            json.dump(data_state, f, indent=2)
+
+        (checkpoint / CHECKPOINT_COMPLETE_MARKER).write_text(
+            "complete\n", encoding="utf-8"
+        )
+        print(f"[CKPT] Saved: {checkpoint}")
+
+        if self.keep > 0:
+            others = [c for c in list_checkpoints(run_dir) if c != checkpoint]
+            for old in others[: max(0, len(others) - (self.keep - 1))]:
+                print(f"[CKPT] Removing old checkpoint: {old}")
+                shutil.rmtree(old, ignore_errors=True)
+
+
+def distributed_any(flags):
+    """Element-wise OR of boolean flags across ranks."""
+    if not (dist.is_available() and dist.is_initialized()):
+        return [bool(f) for f in flags]
+
+    device = (
+        torch.cuda.current_device()
+        if torch.cuda.is_available()
+        else "cpu"
+    )
+    tensor = torch.tensor(
+        [1 if f else 0 for f in flags],
+        dtype=torch.int32,
+        device=device,
+    )
+    dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
+    return [bool(v) for v in tensor.tolist()]
+
+
+class InterruptionGuard(TrainerCallback):
+    """
+    Extra saves for runs on a reserved (time-limited) GPU:
+
+      - save every `save_interval_minutes` (in addition to save_steps),
+      - save and stop cleanly `stop_margin_minutes` before `stop_at`,
+      - save and stop cleanly on SIGTERM / SIGINT.
+
+    Decisions are all-reduced so every rank saves/stops at the same step.
+    Note: torchrun kills its workers ~30 s after torchrun itself is
+    signalled, so stop through scripts/run_benchmark.sh (it signals the
+    workers directly) or rely on stop_at for large checkpoints.
+    """
+
+    def __init__(self, save_interval_minutes: float, stop_at, stop_margin_minutes: float):
+        self.save_interval = save_interval_minutes * 60
+        self.deadline = (
+            stop_at.timestamp() - stop_margin_minutes * 60
+            if stop_at is not None
+            else None
+        )
+        self.last_save = time.time()
+        self.signal_name = None
+        self.stop_reason = None
+
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            signal.signal(sig, self._on_signal)
+
+    def _on_signal(self, signum, frame):
+        if self.signal_name is not None:
+            # Ctrl+C / group kills reach a worker more than once; keep saving.
+            # Use SIGKILL to abort without saving.
+            return
+        self.signal_name = signal.Signals(signum).name
+        print(
+            f"[GUARD] {self.signal_name} received: "
+            "saving a checkpoint after the current step, then stopping."
+        )
+
+    def on_step_end(self, args, state, control, **kwargs):
+        now = time.time()
+        got_signal, past_deadline, interval_due = distributed_any([
+            self.signal_name is not None,
+            self.deadline is not None and now >= self.deadline,
+            self.save_interval > 0 and now - self.last_save >= self.save_interval,
+        ])
+
+        if got_signal or past_deadline:
+            self.stop_reason = "signal" if got_signal else "stop_at deadline"
+            control.should_save = True
+            control.should_training_stop = True
+            if state.is_world_process_zero:
+                print(
+                    f"[GUARD] Stopping at step {state.global_step} "
+                    f"({self.stop_reason}). Re-run the same command to resume."
+                )
+        elif interval_due:
+            control.should_save = True
+
+        return control
+
+    def on_save(self, args, state, control, **kwargs):
+        self.last_save = time.time()
+
+
+class CheckpointSync(TrainerCallback):
+    """
+    Mirror the run dir to `checkpoint_sync_target` with rsync (rank 0 only)
+    after every complete checkpoint, so progress survives losing the
+    machine's local disk. The target may be a local/mounted path or
+    user@host:/path (needs passwordless SSH). Runs in the background;
+    a save that lands while a sync is running is picked up afterwards.
+    """
+
+    def __init__(self, target: str, output_base: Path, run_dir: Path, rank: int):
+        self.enabled = bool(target) and rank == 0
+        self.target = str(target).rstrip("/") + "/" if target else ""
+        # "/./" makes rsync -R recreate <model>/<run>/ under the target.
+        self.source = f"{output_base.parent}/./{output_base.name}/{run_dir.name}/"
+        self.proc = None
+        self.pending = False
+
+    def _command(self):
+        return [
+            "rsync", "-aR", "--delete",
+            "-e", "ssh -o BatchMode=yes",
+            self.source, self.target,
+        ]
+
+    def _poll(self):
+        if self.proc is None or self.proc.poll() is None:
+            return
+        if self.proc.returncode != 0:
+            print(f"[SYNC] WARNING: rsync exited with code {self.proc.returncode}")
+        self.proc = None
+
+    def _start(self):
+        print(f"[SYNC] {self.source} -> {self.target}")
+        self.proc = subprocess.Popen(self._command())
+        self.pending = False
+
+    def on_save(self, args, state, control, **kwargs):
+        if not self.enabled:
+            return
+        self._poll()
+        if self.proc is None:
+            self._start()
+        else:
+            self.pending = True
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if not self.enabled:
+            return
+        self._poll()
+        if self.pending and self.proc is None:
+            self._start()
+
+    def final_sync(self):
+        """Blocking sync at exit (last checkpoint, final model, metrics)."""
+        if not self.enabled:
+            return
+        if self.proc is not None:
+            self.proc.wait()
+        print(f"[SYNC] Final sync -> {self.target}")
+        returncode = subprocess.run(self._command()).returncode
+        if returncode != 0:
+            print(f"[SYNC] WARNING: final rsync exited with code {returncode}")
+
+
+def export_final_model(trainer, final_dir: Path, tokenizer_path: Path):
+    """
+    Save a plain HF model (full FT) or adapter (LoRA/QLoRA) to final_dir.
+
+    The ZeRO-3 configs keep stage3_gather_16bit_weights_on_model_save=false
+    so periodic checkpoints stay sharded; save_model() would then write yet
+    another ZeRO checkpoint. Gather the 16-bit weights once here instead
+    (collective: runs on every rank, assembled on rank 0's CPU).
+    """
+    if trainer.is_deepspeed_enabled and is_deepspeed_zero3_enabled():
+        state_dict = trainer.model_wrapped._zero3_consolidated_16bit_state_dict()
+        if trainer.args.should_save:
+            trainer._save(str(final_dir), state_dict=state_dict)
+    else:
+        trainer.save_model(str(final_dir))
+
+    if trainer.args.should_save:
+        AutoTokenizer.from_pretrained(
+            tokenizer_path,
+            use_fast=True,
+            local_files_only=True,
+            trust_remote_code=True,
+        ).save_pretrained(str(final_dir))
+        print(f"[FINAL] Model saved: {final_dir}")
+
+
 class SteadyStateTimer(TrainerCallback):
+    """
+    Times steady-state steps of this session.
+
+    Warmup is counted from the step training (re)started at, and time spent
+    writing checkpoints is excluded so saves do not skew throughput.
+    """
+
     def __init__(self, warmup_steps: int):
         self.warmup_steps = warmup_steps
+        self.initial_step = 0
         self.start_step = None
         self.start_time = None
         self.end_step = None
         self.elapsed = None
+        self.last_step_end = None
+        self.save_seconds = 0.0
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        # Non-zero when resuming from a checkpoint.
+        self.initial_step = state.global_step
 
     def on_step_end(self, args, state, control, **kwargs):
-        if self.start_time is None and state.global_step >= self.warmup_steps:
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        self.last_step_end = time.perf_counter()
+
+        if (
+            self.start_time is None
+            and state.global_step - self.initial_step >= self.warmup_steps
+        ):
             self.start_step = state.global_step
-            self.start_time = time.perf_counter()
+            self.start_time = self.last_step_end
+
+    def on_save(self, args, state, control, **kwargs):
+        if self.start_time is not None and self.last_step_end is not None:
+            self.save_seconds += time.perf_counter() - self.last_step_end
 
     def on_train_end(self, args, state, control, **kwargs):
         if self.start_time is None:
@@ -350,7 +688,9 @@ class SteadyStateTimer(TrainerCallback):
             torch.cuda.synchronize()
 
         self.end_step = state.global_step
-        self.elapsed = time.perf_counter() - self.start_time
+        self.elapsed = (
+            time.perf_counter() - self.start_time - self.save_seconds
+        )
 
     @property
     def measured_steps(self):
@@ -400,6 +740,24 @@ def parse_args(description: str):
     parser.add_argument(
         "--rebuild_cache",
         action="store_true",
+    )
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        default=None,
+        help="Resume from this checkpoint instead of the newest one in output_dir.",
+    )
+    parser.add_argument(
+        "--no_resume",
+        action="store_true",
+        help="Start from scratch even if config.yaml has resume: true.",
+    )
+    parser.add_argument(
+        "--stop_at",
+        default=None,
+        help=(
+            "End of the GPU reservation in local time, e.g. '2026-10-09 18:00'. "
+            "Training saves and stops stop_margin_minutes before it."
+        ),
     )
     return parser.parse_args()
 
@@ -468,6 +826,49 @@ def prepare_run(cfg, args, run_name_prefix: str = ""):
     run_dir = output_base / f"{run_name_prefix}{attn_impl}_{world_size}gpu"
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    # Checkpointing: optimizer/scheduler/RNG/DeepSpeed state is saved too,
+    # so an interrupted run continues exactly where it stopped.
+    save_steps = int(cfg.get("save_steps", 0))
+    save_total_limit = int(cfg.get("save_total_limit", 1))
+
+    # Stored in every checkpoint and compared on resume (see DATA_ORDER_KEYS).
+    data_state = {
+        "dataset_signature": cache_metadata.get("signature"),
+        "num_sequences": len(dataset),
+        "shuffle_documents": bool(cfg.get("shuffle_documents", True)),
+        "data_seed": int(cfg.get("data_seed", 42)),
+        "seed": int(cfg.get("seed", 42)),
+        "world_size": world_size,
+        "micro_batch_size": int(cfg.get("micro_batch_size", 1)),
+        "gradient_accumulation_steps": int(cfg.get("gradient_accumulation_steps", 1)),
+        "seq_len": seq_len,
+    }
+
+    if args.resume_from_checkpoint:
+        resume_checkpoint = resolve_path(args.resume_from_checkpoint)
+        if not resume_checkpoint.is_dir():
+            raise FileNotFoundError(
+                f"Checkpoint not found: {resume_checkpoint}"
+            )
+    elif bool(cfg.get("resume", True)) and not args.no_resume:
+        resume_checkpoint = find_resume_checkpoint(run_dir, rank)
+    else:
+        resume_checkpoint = None
+        if list_checkpoints(run_dir):
+            # The first save of a fresh run would delete the previous run's
+            # checkpoints; make that an explicit decision.
+            raise RuntimeError(
+                f"Starting from scratch, but checkpoints already exist in "
+                f"{run_dir}. Move or delete them first."
+            )
+
+    if resume_checkpoint is not None:
+        check_data_state(resume_checkpoint, data_state, rank)
+
+    stop_at = datetime.fromisoformat(args.stop_at) if args.stop_at else None
+    if stop_at is not None and stop_at <= datetime.now():
+        raise ValueError(f"--stop_at is in the past: {stop_at}")
+
     # Important for ZeRO-3:
     # construct TrainingArguments (and therefore DeepSpeed integration)
     # before from_pretrained().
@@ -491,8 +892,16 @@ def prepare_run(cfg, args, run_name_prefix: str = ""):
         gradient_checkpointing_kwargs={"use_reentrant": False},
         logging_steps=int(cfg.get("logging_steps", 10)),
         logging_first_step=True,
-        save_strategy="no",
-        report_to="none",
+        save_strategy="steps" if save_steps > 0 else "no",
+        save_steps=save_steps if save_steps > 0 else 500,
+        # Old checkpoints are removed by CheckpointCompleteMarker instead.
+        save_total_limit=None,
+        # Resume skips the batches already trained on, so the data
+        # continues where it stopped (never set this to True).
+        ignore_data_skip=False,
+        # One fixed dir, so curves continue across resumed sessions.
+        report_to=cfg.get("report_to", "none") or "none",
+        logging_dir=str(run_dir / "tensorboard"),
         remove_unused_columns=False,
         dataloader_num_workers=int(
             cfg.get("dataloader_num_workers", 4)
@@ -521,7 +930,13 @@ def prepare_run(cfg, args, run_name_prefix: str = ""):
         grad_accum=grad_accum,
         max_steps=max_steps,
         warmup_steps=warmup_steps,
+        output_base=output_base,
         run_dir=run_dir,
+        save_steps=save_steps,
+        save_total_limit=save_total_limit,
+        resume_checkpoint=resume_checkpoint,
+        data_state=data_state,
+        stop_at=stop_at,
         training_args=training_args,
     )
 
@@ -546,6 +961,20 @@ def print_run_header(title: str, cfg, run, model_path: Path, extra=None):
     print(f"Micro batch / GPU     : {run.micro_batch}")
     print(f"Gradient accumulation : {run.grad_accum}")
     print(f"Max optimizer steps   : {run.max_steps}")
+    print(f"Output dir            : {run.run_dir}")
+    if run.save_steps > 0:
+        keep = run.save_total_limit if run.save_total_limit > 0 else "all"
+        print(f"Checkpoint every      : {run.save_steps} steps (keep {keep})")
+    else:
+        print("Checkpoint every      : disabled")
+    interval = float(cfg.get("save_interval_minutes", 0))
+    if interval > 0:
+        print(f"Checkpoint every      : {interval:g} min")
+    print(f"Resume from           : {run.resume_checkpoint or 'scratch'}")
+    if run.stop_at is not None:
+        margin = float(cfg.get("stop_margin_minutes", 10))
+        print(f"Stop at               : {run.stop_at} (save {margin:g} min before)")
+    print(f"Checkpoint sync       : {cfg.get('checkpoint_sync_target') or 'disabled'}")
     print("=" * 80)
 
 
@@ -646,19 +1075,41 @@ def train_and_report(cfg, run, model, model_load_seconds: float, extra_metrics=N
     #    forward -> NTP loss -> backward -> optimizer -> ZeRO comm
     # --------------------------------------------------------------
     timer = SteadyStateTimer(warmup_steps)
+    guard = InterruptionGuard(
+        save_interval_minutes=float(cfg.get("save_interval_minutes", 0)),
+        stop_at=run.stop_at,
+        stop_margin_minutes=float(cfg.get("stop_margin_minutes", 10)),
+    )
+    sync = CheckpointSync(
+        cfg.get("checkpoint_sync_target"), run.output_base, run_dir, rank
+    )
 
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=dataset,
         data_collator=CausalLMCollator(),
-        callbacks=[timer],
+        # Order matters: the marker (and old-checkpoint removal) must finish
+        # before the timer measures the save and before the sync starts.
+        callbacks=[
+            CheckpointCompleteMarker(run.save_total_limit, run.data_state),
+            timer,
+            guard,
+            sync,
+        ],
     )
 
-    train_result = trainer.train()
+    resume_checkpoint = run.resume_checkpoint
+    train_result = trainer.train(
+        resume_from_checkpoint=(
+            str(resume_checkpoint) if resume_checkpoint else None
+        )
+    )
+    # Runtime and steps of this session only (not of earlier, resumed ones).
     train_runtime = float(
         train_result.metrics.get("train_runtime", 0.0)
     )
+    session_steps = trainer.state.global_step - timer.initial_step
 
     tokens_per_optimizer_step = (
         world_size
@@ -668,7 +1119,7 @@ def train_and_report(cfg, run, model, model_load_seconds: float, extra_metrics=N
     )
 
     processed_tokens = (
-        trainer.state.global_step
+        session_steps
         * tokens_per_optimizer_step
     )
 
@@ -690,7 +1141,7 @@ def train_and_report(cfg, run, model, model_load_seconds: float, extra_metrics=N
     else:
         steady_tps = overall_tps
         steady_step_seconds = (
-            train_runtime / max(1, trainer.state.global_step)
+            train_runtime / max(1, session_steps)
         )
 
     projected_epoch_hours = (
@@ -716,6 +1167,14 @@ def train_and_report(cfg, run, model, model_load_seconds: float, extra_metrics=N
         / (1024 ** 3)
     )
 
+    # After the memory measurements, so the export does not skew them.
+    # Only a run that reached its end gets a final model; an interrupted one
+    # is continued from its checkpoint by re-running the same command.
+    final_dir = None
+    if guard.stop_reason is None and bool(cfg.get("export_final_model", True)):
+        final_dir = run_dir / "final"
+        export_final_model(trainer, final_dir, resolve_path(cfg["model_path"]))
+
     metrics = {
         "name": cfg["name"],
         **(extra_metrics or {}),
@@ -725,6 +1184,13 @@ def train_and_report(cfg, run, model, model_load_seconds: float, extra_metrics=N
         "micro_batch_size_per_gpu": micro_batch,
         "gradient_accumulation_steps": grad_accum,
         "completed_optimizer_steps": trainer.state.global_step,
+        "resumed_from_checkpoint": (
+            str(resume_checkpoint) if resume_checkpoint else None
+        ),
+        "session_optimizer_steps": session_steps,
+        "checkpoint_save_seconds": timer.save_seconds,
+        "stopped_early": guard.stop_reason,
+        "final_model_dir": str(final_dir) if final_dir else None,
         "preprocessing_seconds": cache_metadata.get(
             "preprocessing_seconds"
         ),
@@ -767,7 +1233,14 @@ def train_and_report(cfg, run, model, model_load_seconds: float, extra_metrics=N
                 f"{projected_epoch_hours:.2f} hours"
             )
         print(f"Metrics JSON        : {metrics_path}")
+        if guard.stop_reason is not None:
+            print(f"Stopped early       : {guard.stop_reason} "
+                  f"(step {trainer.state.global_step}; re-run to resume)")
+        elif final_dir is not None:
+            print(f"Final model         : {final_dir}")
         print("=" * 80)
+
+    sync.final_sync()
 
 
 if __name__ == "__main__":

@@ -64,6 +64,33 @@ defaults:
   dataloader_num_workers: 4
   seed: 42
 
+  # Checkpointing / resume (output_dir/<run>/checkpoint-<step>/)
+  #   Full training state (weights or adapters + optimizer + scheduler +
+  #   RNG + DeepSpeed shards) is saved, so a run that was cut off continues
+  #   from the last complete checkpoint when launched again with the same
+  #   command. Resuming needs the same GPU count (it is part of the run dir).
+  save_steps: 100          # save every N optimizer steps; 0 disables
+  save_interval_minutes: 30  # also save every N minutes; 0 disables
+  # Keep only the newest N checkpoints; 0 keeps all. With 1, the previous
+  # checkpoint is deleted right after the new one is completely written
+  # (never overwritten in place, so a shutdown mid-save cannot lose both).
+  save_total_limit: 1
+  resume: true             # auto-resume (CLI: --no_resume / --resume_from_checkpoint)
+
+  # GPU reservation end: launch with --stop_at "2026-10-09 18:00" (or env
+  # STOP_AT=... for scripts/run_*.sh). Training saves and exits cleanly this
+  # many minutes before it. Must cover one checkpoint save (+ final sync).
+  stop_margin_minutes: 10
+
+  # Mirror output_dir/<run>/ here after every checkpoint (rsync, rank 0).
+  # Local/mounted path or user@host:/path (passwordless SSH). null disables.
+  checkpoint_sync_target: null
+
+  # Save a plain HF model / LoRA adapter to output_dir/<run>/final at the end.
+  export_final_model: true
+
+  report_to: tensorboard   # tensorboard | none  (logs in output_dir/<run>/tensorboard)
+
 # ---------------------------------------------------------------------
 # 4-bit QLoRA settings (src/train_qlora.py, scripts/quantize_models.py)
 #   Applied on top of defaults + the model entry. 4-bit weights are frozen,
@@ -116,8 +143,10 @@ models:
     cache_path: data/cache/ax4_72b_seq2048
     output_dir: outputs/ax4_72b
     deepspeed_config: configs/deepspeed/zero3_cpu_offload.json
+    stop_margin_minutes: 40   # ~1 TB full-FT checkpoint (bf16 weights + fp32 Adam)
     qlora:
       deepspeed_config: configs/deepspeed/zero3_qlora.json
+      stop_margin_minutes: 10
 
   ax4_light_7b:
     repo_id: skt/A.X-4.0-Light
@@ -135,8 +164,10 @@ models:
     cache_path: data/cache/qwen25_72b_seq2048
     output_dir: outputs/qwen25_72b
     deepspeed_config: configs/deepspeed/zero3_cpu_offload.json
+    stop_margin_minutes: 40   # ~1 TB full-FT checkpoint (bf16 weights + fp32 Adam)
     qlora:
       deepspeed_config: configs/deepspeed/zero3_qlora.json
+      stop_margin_minutes: 10
 
   qwen25_72b_lora:
     repo_id: Qwen/Qwen2.5-72B
@@ -178,5 +209,7 @@ models:
     cache_path: data/cache/apertus_70b_seq2048
     output_dir: outputs/apertus_70b
     deepspeed_config: configs/deepspeed/zero3_cpu_offload.json
+    stop_margin_minutes: 40   # ~1 TB full-FT checkpoint (bf16 weights + fp32 Adam)
     qlora:
       deepspeed_config: configs/deepspeed/zero3_qlora.json
+      stop_margin_minutes: 10
