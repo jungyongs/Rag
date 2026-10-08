@@ -18,6 +18,8 @@ DS_OVERRIDE="${4:-}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIG="${CONFIG:-${ROOT}/config.yaml}"
+# train_benchmark.py (BF16) or train_qlora.py (4-bit); see run_qlora.sh
+TRAIN_SCRIPT="${TRAIN_SCRIPT:-train_benchmark.py}"
 
 if [[ ! -f "$CONFIG" ]]; then
   echo "Config not found: $CONFIG"
@@ -27,6 +29,7 @@ fi
 IFS=',' read -r -a GPU_ARRAY <<< "$GPU_LIST"
 NUM_GPUS="${#GPU_ARRAY[@]}"
 
+echo "Script      : $TRAIN_SCRIPT"
 echo "Model       : $MODEL_KEY"
 echo "Attention   : $ATTN"
 echo "GPU list    : $GPU_LIST"
@@ -36,7 +39,7 @@ CMD=(
   torchrun
   --standalone
   --nproc_per_node="$NUM_GPUS"
-  "${ROOT}/src/train_benchmark.py"
+  "${ROOT}/src/${TRAIN_SCRIPT}"
   --config "$CONFIG"
   --model "$MODEL_KEY"
   --attn_implementation "$ATTN"

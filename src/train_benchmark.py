@@ -6,6 +6,7 @@ import random
 import shutil
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import psutil
 import torch
@@ -38,8 +39,23 @@ def load_yaml(path: Path):
         return yaml.safe_load(f)
 
 
-def load_model_config(config_path: Path, model_key: str):
-    """Merge `defaults` with `models.<model_key>` from the central config."""
+def deep_merge(base: dict, override: dict):
+    out = dict(base)
+    for key, value in (override or {}).items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = deep_merge(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+def load_model_config(config_path: Path, model_key: str, qlora: bool = False):
+    """
+    Build the effective config for one model from the central config.
+
+    BF16 : defaults < models.<key>
+    QLoRA: defaults < models.<key> < qlora < models.<key>.qlora
+    """
     root = load_yaml(config_path)
     models = root.get("models", {})
 
@@ -49,7 +65,14 @@ def load_model_config(config_path: Path, model_key: str):
             f"Available: {', '.join(models)}"
         )
 
-    cfg = {**root.get("defaults", {}), **models[model_key]}
+    model_cfg = dict(models[model_key])
+    model_qlora_cfg = model_cfg.pop("qlora", None) or {}
+
+    cfg = deep_merge(root.get("defaults", {}), model_cfg)
+    if qlora:
+        cfg = deep_merge(cfg, root.get("qlora", {}))
+        cfg = deep_merge(cfg, model_qlora_cfg)
+
     cfg["name"] = model_key
     return cfg
 
@@ -356,10 +379,8 @@ def distributed_max(value: float):
     return float(tensor.item())
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Integrated tokenize/cache + full-parameter DeepSpeed benchmark."
-    )
+def parse_args(description: str):
+    parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--model", required=True)
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     parser.add_argument(
@@ -380,10 +401,16 @@ def main():
         "--rebuild_cache",
         action="store_true",
     )
-    args = parser.parse_args()
+    return parser.parse_args()
 
-    cfg = load_model_config(resolve_path(args.config), args.model)
 
+def prepare_run(cfg, args, run_name_prefix: str = ""):
+    """
+    Setup shared by the BF16 and QLoRA benchmarks:
+    token cache, dataset, and TrainingArguments.
+
+    Must be called before from_pretrained() (required for ZeRO-3).
+    """
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
 
@@ -407,7 +434,6 @@ def main():
     # --------------------------------------------------------------
     # 2. Training settings
     # --------------------------------------------------------------
-    model_path = resolve_path(cfg["model_path"])
     output_base = resolve_path(cfg["output_dir"])
 
     attn_impl = (
@@ -415,8 +441,12 @@ def main():
         or cfg.get("attn_implementation", "flash_attention_2")
     )
 
-    ds_path = resolve_path(
-        args.deepspeed_config or cfg["deepspeed_config"]
+    # "none" / null disables DeepSpeed (e.g. single GPU or native Windows).
+    ds_value = args.deepspeed_config or cfg.get("deepspeed_config")
+    ds_path = (
+        None
+        if ds_value in (None, "", "none")
+        else resolve_path(ds_value)
     )
 
     micro_batch = int(cfg.get("micro_batch_size", 1))
@@ -435,7 +465,7 @@ def main():
 
     set_seed(int(cfg.get("seed", 42)))
 
-    run_dir = output_base / f"{attn_impl}_{world_size}gpu"
+    run_dir = output_base / f"{run_name_prefix}{attn_impl}_{world_size}gpu"
     run_dir.mkdir(parents=True, exist_ok=True)
 
     # Important for ZeRO-3:
@@ -456,6 +486,9 @@ def main():
         gradient_checkpointing=bool(
             cfg.get("gradient_checkpointing", True)
         ),
+        # Trainer re-enables checkpointing with these kwargs; without them
+        # it falls back to use_reentrant=True.
+        gradient_checkpointing_kwargs={"use_reentrant": False},
         logging_steps=int(cfg.get("logging_steps", 10)),
         logging_first_step=True,
         save_strategy="no",
@@ -467,29 +500,92 @@ def main():
         dataloader_pin_memory=True,
         dataloader_drop_last=True,
         ddp_find_unused_parameters=False,
-        deepspeed=str(ds_path),
+        deepspeed=str(ds_path) if ds_path else None,
         seed=int(cfg.get("seed", 42)),
     )
 
-    if rank == 0:
-        print("\n" + "=" * 80)
-        print("FULL TRAINING BENCHMARK")
-        print("=" * 80)
-        print(f"Model                 : {model_path}")
-        print(f"Raw data              : {resolve_path(cfg['data_path'])}")
-        print(f"Token cache           : {cache_path}")
-        print(f"Dataset tokens        : {dataset_tokens:,}")
-        print(f"Attention             : {attn_impl}")
-        print(f"DeepSpeed             : {ds_path}")
-        print(f"World size            : {world_size}")
-        print(f"Sequence length       : {seq_len}")
-        print(f"Micro batch / GPU     : {micro_batch}")
-        print(f"Gradient accumulation : {grad_accum}")
-        print(f"Max optimizer steps   : {max_steps}")
-        print("=" * 80)
-
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
+
+    return SimpleNamespace(
+        rank=rank,
+        world_size=world_size,
+        cache_metadata=cache_metadata,
+        cache_path=cache_path,
+        dataset=dataset,
+        dataset_tokens=dataset_tokens,
+        seq_len=seq_len,
+        attn_impl=attn_impl,
+        ds_path=ds_path,
+        micro_batch=micro_batch,
+        grad_accum=grad_accum,
+        max_steps=max_steps,
+        warmup_steps=warmup_steps,
+        run_dir=run_dir,
+        training_args=training_args,
+    )
+
+
+def print_run_header(title: str, cfg, run, model_path: Path, extra=None):
+    if run.rank != 0:
+        return
+
+    print("\n" + "=" * 80)
+    print(title)
+    print("=" * 80)
+    print(f"Model                 : {model_path}")
+    for label, value in (extra or {}).items():
+        print(f"{label:<22}: {value}")
+    print(f"Raw data              : {resolve_path(cfg['data_path'])}")
+    print(f"Token cache           : {run.cache_path}")
+    print(f"Dataset tokens        : {run.dataset_tokens:,}")
+    print(f"Attention             : {run.attn_impl}")
+    print(f"DeepSpeed             : {run.ds_path}")
+    print(f"World size            : {run.world_size}")
+    print(f"Sequence length       : {run.seq_len}")
+    print(f"Micro batch / GPU     : {run.micro_batch}")
+    print(f"Gradient accumulation : {run.grad_accum}")
+    print(f"Max optimizer steps   : {run.max_steps}")
+    print("=" * 80)
+
+
+def build_lora_config(cfg):
+    return LoraConfig(
+        r=int(cfg.get("lora_r", 16)),
+        lora_alpha=int(cfg.get("lora_alpha", 32)),
+        lora_dropout=float(cfg.get("lora_dropout", 0.05)),
+        bias=cfg.get("lora_bias", "none"),
+        target_modules=cfg.get(
+            "lora_target_modules",
+            [
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            ],
+        ),
+        task_type=TaskType.CAUSAL_LM,
+    )
+
+
+def main():
+    args = parse_args(
+        "Integrated tokenize/cache + BF16 (full / LoRA) DeepSpeed benchmark."
+    )
+    cfg = load_model_config(resolve_path(args.config), args.model)
+    run = prepare_run(cfg, args)
+
+    model_path = resolve_path(cfg["model_path"])
+    attn_impl = run.attn_impl
+    rank = run.rank
+
+    print_run_header(
+        "FULL TRAINING BENCHMARK", cfg, run, model_path,
+        {"Training mode": cfg.get("training_mode", "fft")},
+    )
 
     # --------------------------------------------------------------
     # 3. Model load
@@ -517,34 +613,34 @@ def main():
     model_load_seconds = time.perf_counter() - load_start
 
     if cfg.get("training_mode", "fft") == "lora":
-
-        lora_config = LoraConfig(
-            r=int(cfg.get("lora_r", 16)),
-            lora_alpha=int(cfg.get("lora_alpha", 32)),
-            lora_dropout=float(cfg.get("lora_dropout", 0.05)),
-            bias=cfg.get("lora_bias", "none"),
-            target_modules=cfg.get(
-                "lora_target_modules",
-                [
-                    "q_proj",
-                    "k_proj",
-                    "v_proj",
-                    "o_proj",
-                    "gate_proj",
-                    "up_proj",
-                    "down_proj",
-                ],
-            ),
-            task_type=TaskType.CAUSAL_LM,
-        )
-
-        model = get_peft_model(model, lora_config)
+        model = get_peft_model(model, build_lora_config(cfg))
 
         if hasattr(model, "enable_input_require_grads"):
             model.enable_input_require_grads()
 
         if rank == 0:
             model.print_trainable_parameters()
+
+    train_and_report(
+        cfg, run, model, model_load_seconds,
+        {"precision": "bf16", "training_mode": cfg.get("training_mode", "fft")},
+    )
+
+
+def train_and_report(cfg, run, model, model_load_seconds: float, extra_metrics=None):
+    rank = run.rank
+    world_size = run.world_size
+    cache_metadata = run.cache_metadata
+    dataset = run.dataset
+    dataset_tokens = run.dataset_tokens
+    seq_len = run.seq_len
+    attn_impl = run.attn_impl
+    micro_batch = run.micro_batch
+    grad_accum = run.grad_accum
+    warmup_steps = run.warmup_steps
+    run_dir = run.run_dir
+    training_args = run.training_args
+
     # --------------------------------------------------------------
     # 4. Actual training benchmark:
     #    forward -> NTP loss -> backward -> optimizer -> ZeRO comm
@@ -622,6 +718,7 @@ def main():
 
     metrics = {
         "name": cfg["name"],
+        **(extra_metrics or {}),
         "attention": attn_impl,
         "world_size": world_size,
         "sequence_length": seq_len,

@@ -2,12 +2,17 @@
 # Central configuration for the whole project.
 #
 # - All relative paths are resolved against the project root.
-# - Each entry under `models` is merged on top of `defaults`
-#   (model-specific values win).
+# - Effective config for one model (later wins, nested dicts are merged):
+#     BF16  (src/train_benchmark.py): defaults < models.<key>
+#     4-bit (src/train_qlora.py)    : defaults < models.<key>
+#                                     < qlora < models.<key>.qlora
 # - Used by:
-#     src/train_benchmark.py      (--model <key>)
+#     src/train_benchmark.py      (--model <key>)   BF16 full / LoRA
+#     src/train_qlora.py          (--model <key>)   4-bit QLoRA
 #     scripts/download_models.py  (--model <key>|all)
+#     scripts/quantize_models.py  (--model <key>|all)
 #     scripts/run_benchmark*.sh   (<model_key>)
+#     scripts/run_qlora.sh        (<model_key>)
 #     make_dummy_1gb.py
 # =====================================================================
 
@@ -60,21 +65,64 @@ defaults:
   seed: 42
 
 # ---------------------------------------------------------------------
+# 4-bit QLoRA settings (src/train_qlora.py, scripts/quantize_models.py)
+#   Applied on top of defaults + the model entry. 4-bit weights are frozen,
+#   so training is always LoRA adapters on a quantized base.
+# ---------------------------------------------------------------------
+qlora:
+  # false: quantize the BF16 checkpoint (`model_path`) on load
+  # true : load `quantized_model_path` (run scripts/quantize_models.py first)
+  use_prequantized: false
+
+  quantization:
+    bnb_4bit_quant_type: nf4          # nf4 | fp4
+    bnb_4bit_use_double_quant: true
+    bnb_4bit_compute_dtype: bfloat16
+    bnb_4bit_quant_storage: bfloat16  # must be bfloat16 for ZeRO-3
+
+  # ZeRO-2: each GPU holds the whole 4-bit model. Use zero3_qlora.json
+  # to shard it (set per model below for 70B+).
+  deepspeed_config: configs/deepspeed/zero2_qlora.json
+
+  optim: adamw_torch
+  learning_rate: 1.0e-4
+  weight_decay: 0.0
+
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  lora_bias: none
+  lora_target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+# ---------------------------------------------------------------------
 # Models
-#   repo_id    : Hugging Face repo (used by download_models.py)
-#   model_path : local checkpoint location
+#   repo_id              : Hugging Face repo (used by download_models.py)
+#   model_path           : local BF16 checkpoint location
+#   quantized_model_path : local 4-bit checkpoint (quantize_models.py output)
+#   qlora                : per-model overrides used only for 4-bit runs
 # ---------------------------------------------------------------------
 models:
   ax4_72b:
     repo_id: skt/A.X-4.0
     model_path: models/AX-4.0
+    quantized_model_path: models/AX-4.0-bnb-4bit
     cache_path: data/cache/ax4_72b_seq2048
     output_dir: outputs/ax4_72b
     deepspeed_config: configs/deepspeed/zero3_cpu_offload.json
+    qlora:
+      deepspeed_config: configs/deepspeed/zero3_qlora.json
 
   ax4_light_7b:
     repo_id: skt/A.X-4.0-Light
     model_path: models/AX-4.0-Light
+    quantized_model_path: models/AX-4.0-Light-bnb-4bit
     cache_path: data/cache/ax4_light_7b_seq2048
     output_dir: outputs/ax4_light_7b
     deepspeed_config: configs/deepspeed/zero2.json
@@ -83,13 +131,17 @@ models:
   qwen25_72b:
     repo_id: Qwen/Qwen2.5-72B
     model_path: models/Qwen2.5-72B
+    quantized_model_path: models/Qwen2.5-72B-bnb-4bit
     cache_path: data/cache/qwen25_72b_seq2048
     output_dir: outputs/qwen25_72b
     deepspeed_config: configs/deepspeed/zero3_cpu_offload.json
+    qlora:
+      deepspeed_config: configs/deepspeed/zero3_qlora.json
 
   qwen25_72b_lora:
     repo_id: Qwen/Qwen2.5-72B
     model_path: models/Qwen2.5-72B
+    quantized_model_path: models/Qwen2.5-72B-bnb-4bit
     cache_path: data/cache/qwen25_72b_seq2048
     output_dir: outputs/qwen25_72b_lora
     deepspeed_config: configs/deepspeed/zero3_lora.json
@@ -114,6 +166,7 @@ models:
   qwen3_8b:
     repo_id: Qwen/Qwen3-8B-Base
     model_path: models/Qwen3-8B-Base
+    quantized_model_path: models/Qwen3-8B-Base-bnb-4bit
     cache_path: data/cache/qwen3_8b_seq2048
     output_dir: outputs/qwen3_8b
     deepspeed_config: configs/deepspeed/zero2.json
@@ -121,6 +174,9 @@ models:
   apertus_70b:
     repo_id: EPFLiGHT/Apertus-70B-MeditronFO
     model_path: models/Apertus-70B-MeditronFO
+    quantized_model_path: models/Apertus-70B-MeditronFO-bnb-4bit
     cache_path: data/cache/apertus_70b_seq2048
     output_dir: outputs/apertus_70b
     deepspeed_config: configs/deepspeed/zero3_cpu_offload.json
+    qlora:
+      deepspeed_config: configs/deepspeed/zero3_qlora.json
