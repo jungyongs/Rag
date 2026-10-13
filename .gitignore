@@ -1,3 +1,15 @@
 /models/
 /logs/
 /outputs/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Generated data (cache is rebuilt by training, dummy by make_dummy_1gb.py)
+/data/cache/
+/data/raw/
+
+# Personal notes / code dumps (not part of the pipeline)
+/CV_answers.txt
+/all_code.txt
