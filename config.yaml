@@ -31,6 +31,10 @@ defaults:
   # Data / tokenization cache
   data_path: data/raw/dummy_1gb.txt
   file_pattern: "**/*.txt"
+  # Files whose name contains any of these strings are left out of training
+  # (e.g. 고객정보_T_샘플.xlsx.txt: names, resident numbers, addresses, phones).
+  exclude_name_keywords:
+    - 고객정보
   seq_len: 2048
   shuffle_documents: true
   data_seed: 42

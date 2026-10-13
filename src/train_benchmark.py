@@ -7,6 +7,7 @@ import shutil
 import signal
 import subprocess
 import time
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -84,12 +85,24 @@ def load_model_config(config_path: Path, model_key: str, qlora: bool = False):
     return cfg
 
 
-def discover_documents(input_path: Path, pattern: str):
+def discover_documents(input_path: Path, pattern: str, exclude_name_keywords=()):
     if input_path.is_file():
         return [input_path]
 
     if input_path.is_dir():
-        return sorted(p for p in input_path.glob(pattern) if p.is_file())
+        # File names may be NFD (macOS origin), so compare in NFC.
+        keywords = [unicodedata.normalize("NFC", k) for k in exclude_name_keywords]
+        files, excluded = [], []
+        for p in sorted(input_path.glob(pattern)):
+            if not p.is_file():
+                continue
+            name = unicodedata.normalize("NFC", p.name)
+            (excluded if any(k in name for k in keywords) else files).append(p)
+        if excluded:
+            print(f"[DATA] Excluded {len(excluded)} file(s) by name keyword {keywords}:")
+            for p in excluded:
+                print(f"[DATA]   - {unicodedata.normalize('NFC', str(p.relative_to(input_path)))}")
+        return files
 
     raise FileNotFoundError(f"Data path not found: {input_path}")
 
@@ -210,7 +223,8 @@ def build_cache_if_needed(cfg, rank: int, rebuild_cache: bool):
     add_eos = bool(cfg.get("add_eos_between_documents", True))
     chunk_chars = int(cfg.get("tokenize_chunk_chars", 1_000_000))
 
-    files = discover_documents(data_path, pattern)
+    exclude_name_keywords = cfg.get("exclude_name_keywords") or []
+    files = discover_documents(data_path, pattern, exclude_name_keywords)
     if not files:
         raise RuntimeError(f"No .txt files found at: {data_path}")
 
