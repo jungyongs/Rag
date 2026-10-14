@@ -30,7 +30,7 @@ from transformers import (
     set_seed,
 )
 from transformers.integrations import is_deepspeed_zero3_enabled
-from peft import LoraConfig, TaskType, get_peft_model
+from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = PROJECT_ROOT / "config.yaml"
@@ -371,7 +371,10 @@ def build_cache_if_needed(cfg, rank: int, rebuild_cache: bool):
         dataset = Dataset.from_generator(
             packed_generator,
             gen_kwargs={
-                "documents": documents,
+                # A tuple, not a list: Dataset.from_generator splits list
+                # kwargs into shards and calls the generator once per item,
+                # which would drop every document's last partial sequence.
+                "documents": tuple(documents),
                 "tokenizer": tokenizer,
                 "seq_len": seq_len,
                 "add_eos_between_documents": add_eos,
@@ -660,9 +663,10 @@ class CheckpointRootBusy(RuntimeError):
 
 def check_checkpoint_root(cfg, run_dir: Path):
     """
-    Allow a run only if checkpoint_root is empty of checkpoints, or holds
-    just this run's own unfinished checkpoints (resume). Never deletes
-    anything: clearing is done by hand with scripts/clear_checkpoints.py.
+    Refuse to start when this run already finished (100% milestone), so a
+    finished run is never trained over. Other models' runs, running or
+    finished, do not block. Never deletes anything: clearing is done by
+    hand with scripts/clear_checkpoints.py.
     """
     if not cfg.get("checkpoint_root"):
         return
@@ -676,23 +680,15 @@ def check_checkpoint_root(cfg, run_dir: Path):
     ]
     candidates += [p for p in root.rglob("milestone-*") if p.is_dir()]
 
-    others, finished = [], []
-    for checkpoint in sorted(candidates):
-        if checkpoint.parent != run_dir:
-            others.append(checkpoint)
-        elif milestone_percent(checkpoint) == 100:
-            finished.append(checkpoint)
+    finished = [
+        c for c in sorted(candidates)
+        if c.parent == run_dir and milestone_percent(c) == 100
+    ]
 
     hint = (
         "Copy the milestone checkpoints off this machine, then clear them by "
         "hand with:\n  python scripts/clear_checkpoints.py"
     )
-    if others:
-        listing = "\n".join(f"  {c}" for c in others)
-        raise CheckpointRootBusy(
-            f"Not starting: {root} holds checkpoints of another fine-tuning:\n"
-            f"{listing}\n{hint}"
-        )
     if finished:
         raise CheckpointRootBusy(
             f"Not starting: this run already finished (100% milestone at "
@@ -870,6 +866,25 @@ class CheckpointSync(TrainerCallback):
             print(f"[SYNC] WARNING: final rsync exited with code {returncode}")
 
 
+def cast_adapter_to_bf16(adapter_dir: Path):
+    """
+    PEFT keeps LoRA weights in fp32; for evaluation bf16 is enough (the base
+    model is bf16) and halves the file. Resume checkpoints are not touched.
+    """
+    from safetensors.torch import load_file, save_file
+
+    path = Path(adapter_dir) / "adapter_model.safetensors"
+    if not path.exists():
+        return
+    tensors = {
+        k: v.to(torch.bfloat16) if v.is_floating_point() else v
+        for k, v in load_file(str(path)).items()
+    }
+    tmp = path.with_suffix(".tmp")
+    save_file(tensors, str(tmp), metadata={"format": "pt"})
+    tmp.replace(path)
+
+
 def export_final_model(trainer, final_dir: Path, tokenizer_path: Path,
                        label: str = "[FINAL] Model saved"):
     """
@@ -881,9 +896,21 @@ def export_final_model(trainer, final_dir: Path, tokenizer_path: Path,
     (collective: runs on every rank, assembled on rank 0's CPU).
     """
     if trainer.is_deepspeed_enabled and is_deepspeed_zero3_enabled():
-        state_dict = trainer.model_wrapped._zero3_consolidated_16bit_state_dict()
-        if trainer.args.should_save:
-            trainer._save(str(final_dir), state_dict=state_dict)
+        if isinstance(trainer.model, PeftModel):
+            # Adapter only: gather just the trainable (LoRA) parameters
+            # instead of consolidating the whole frozen base model.
+            import deepspeed
+
+            trainable = [p for p in trainer.model.parameters() if p.requires_grad]
+            with deepspeed.zero.GatheredParameters(trainable, modifier_rank=None):
+                if trainer.args.should_save:
+                    trainer.model.save_pretrained(str(final_dir))
+            if trainer.args.should_save:
+                cast_adapter_to_bf16(final_dir)
+        else:
+            state_dict = trainer.model_wrapped._zero3_consolidated_16bit_state_dict()
+            if trainer.args.should_save:
+                trainer._save(str(final_dir), state_dict=state_dict)
     else:
         trainer.save_model(str(final_dir))
 
@@ -1172,6 +1199,14 @@ def prepare_run(cfg, args, run_name_prefix: str = ""):
         optim=cfg.get("optim", "adamw_torch"),
         learning_rate=float(cfg.get("learning_rate", 1e-5)),
         weight_decay=float(cfg.get("weight_decay", 0.1)),
+        lr_scheduler_type=cfg.get("lr_scheduler_type", "linear"),
+        warmup_ratio=float(cfg.get("warmup_ratio", 0.0)),
+        lr_scheduler_kwargs=(
+            {"min_lr_rate": float(cfg["min_lr_rate"])}
+            if cfg.get("lr_scheduler_type") == "cosine_with_min_lr"
+            and cfg.get("min_lr_rate") is not None
+            else {}
+        ),
         max_steps=max_steps if max_steps > 0 else -1,
         num_train_epochs=float(cfg.get("num_train_epochs", 1.0)),
         bf16=bool(cfg.get("bf16", True)),
@@ -1253,6 +1288,11 @@ def print_run_header(title: str, cfg, run, model_path: Path, extra=None):
     print(f"Micro batch / GPU     : {run.micro_batch}")
     print(f"Gradient accumulation : {run.grad_accum}")
     print(f"Max optimizer steps   : {run.max_steps}")
+    print(
+        f"LR schedule           : {cfg.get('learning_rate')} "
+        f"{cfg.get('lr_scheduler_type', 'linear')}, warmup_ratio {cfg.get('warmup_ratio', 0.0)}, "
+        f"min_lr_rate {cfg.get('min_lr_rate')}"
+    )
     print(f"Output dir            : {run.run_dir}")
     if run.save_steps > 0:
         keep = run.save_total_limit if run.save_total_limit > 0 else "all"
@@ -1349,6 +1389,23 @@ def main():
     )
 
 
+class CPTTrainer(Trainer):
+    """
+    Trainer that drops empty optimizer param groups. With LoRA every
+    trainable parameter takes weight decay, so the no-decay group is empty;
+    DeepSpeed ZeRO-3 removes it, leaving the LR scheduler with one more
+    group than the optimizer (fails on the first scheduler step).
+    """
+
+    def create_optimizer(self):
+        optimizer = super().create_optimizer()
+        # With an "optimizer" section in the DeepSpeed config (e.g. zero2.json)
+        # this is a placeholder without param_groups; DeepSpeed builds it.
+        if hasattr(optimizer, "param_groups"):
+            optimizer.param_groups[:] = [g for g in optimizer.param_groups if g["params"]]
+        return optimizer
+
+
 def train_and_report(cfg, run, model, model_load_seconds: float, extra_metrics=None):
     rank = run.rank
     world_size = run.world_size
@@ -1386,7 +1443,7 @@ def train_and_report(cfg, run, model, model_load_seconds: float, extra_metrics=N
         weights_only=weights_only, tokenizer_path=tokenizer_path,
     )
 
-    trainer = Trainer(
+    trainer = CPTTrainer(
         model=model,
         args=training_args,
         train_dataset=dataset,

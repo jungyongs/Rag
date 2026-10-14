@@ -29,7 +29,7 @@ dummy_data:
 # ---------------------------------------------------------------------
 defaults:
   # Data / tokenization cache
-  data_path: data/raw/data_out_step4_train_eos_v4.txt   # copied once from ~/shared
+  data_path: data/raw/data_out_step4_train_eos_v5.txt   # copied once from ~/shared
   file_pattern: "**/*.txt"
   # Files whose name contains any of these strings are left out of training
   # (e.g. 고객정보_T_샘플.xlsx.txt: names, resident numbers, addresses, phones).
@@ -80,6 +80,11 @@ defaults:
   optim: adamw_torch
   learning_rate: 1.0e-5
   weight_decay: 0.1
+  # LR schedule: linear warmup over warmup_ratio of the steps, then cosine
+  # decay to min_lr_rate x learning_rate at the last step.
+  lr_scheduler_type: cosine_with_min_lr
+  warmup_ratio: 0.02
+  min_lr_rate: 0.1
 
   # Schedule / logging
   max_steps: -1
@@ -106,10 +111,10 @@ defaults:
   # milestone doubles as the final model.
   # false: milestones are full checkpoints and are all kept.
   milestone_weights_only: true
-  # One fine-tuning at a time: a run does not start while checkpoint_root
-  # holds another run's checkpoints or a finished (100%) run. Copy the
-  # milestones off the machine, then clear them by hand with
-  # scripts/clear_checkpoints.py. Nothing deletes or starts runs on its own.
+  # Runs of different models may train at the same time and their results
+  # are kept. Only re-running a finished (100%) run is refused; clear it by
+  # hand with scripts/clear_checkpoints.py first. Nothing deletes or starts
+  # runs on its own.
   # Only the milestones are saved: no periodic saves in between. A stop
   # (SIGTERM / Ctrl+C / --stop_at) still saves one resume checkpoint.
   save_steps: 0            # save every N optimizer steps; 0 disables
@@ -201,6 +206,7 @@ models:
     deepspeed_config: configs/deepspeed/zero2.json
     # Chat model: eos_token is <|im_end|>; documents end with <|endoftext|>.
     document_end_token: "<|endoftext|>"
+    micro_batch_size: 4      # same as qwen3_8b (smaller model and vocab)
 
   qwen25_72b:
     repo_id: Qwen/Qwen2.5-72B
@@ -222,10 +228,19 @@ models:
     output_dir: qwen25_72b_lora
     deepspeed_config: configs/deepspeed/zero3_lora.json
     training_mode: lora
-    learning_rate: 1.0e-4
+    # Run on 7 GPUs (scripts/run_qwen25_72b_lora_7gpu.sh): 4 x 7 x GA 1 x
+    # 2048 = 57,344 tokens per optimizer step. Measured on 8 GPUs: 45.8 GiB
+    # peak allocated, ~2,535 tokens/s. ZeRO-3 gathers the weights for every
+    # micro-batch, so prefer a larger micro batch over accumulation.
+    # If it runs out of memory: micro_batch_size 2, GA 2 (same tokens/step).
+    micro_batch_size: 4
+    gradient_accumulation_steps: 1
+    learning_rate: 1.0e-4    # warmup + cosine from defaults
     weight_decay: 0.0
-    lora_r: 16
-    lora_alpha: 32
+    # Continued pretraining needs more adapter capacity than instruction
+    # tuning: start at r=64 (~0.84B trainable params, ~1.7 GB adapter).
+    lora_r: 64
+    lora_alpha: 128
     lora_dropout: 0.05
     lora_bias: none
     lora_target_modules:
@@ -244,6 +259,7 @@ models:
     cache_path: data/cache/qwen3_8b_seq2048
     output_dir: qwen3_8b
     deepspeed_config: configs/deepspeed/zero2.json
+    micro_batch_size: 4      # measured on 4x A100 80GB: 54.6 GiB peak, ~10.9k tokens/s
 
   apertus_70b:
     repo_id: EPFLiGHT/Apertus-70B-MeditronFO
