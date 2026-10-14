@@ -78,6 +78,11 @@ if [[ -n "${STOP_AT:-}" ]]; then
   STOP_AT_EPOCH="$(date -d "$STOP_AT" +%s)"
 fi
 
+# Refuse up front (no retries) when checkpoint_root holds another run's or a
+# finished run's checkpoints. This never deletes anything.
+WORLD_SIZE="$NUM_GPUS" python "${ROOT}/src/${TRAIN_SCRIPT}" \
+  --config "$CONFIG" --model "$MODEL_KEY" --attn_implementation "$ATTN" --preflight
+
 # Graceful stop: signal the training workers directly. Signalling torchrun
 # instead makes it SIGKILL the workers ~30 s later, which can cut off a
 # large checkpoint mid-save.

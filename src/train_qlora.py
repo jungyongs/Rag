@@ -22,6 +22,7 @@ from train_benchmark import (
     build_lora_config,
     load_model_config,
     parse_args,
+    preflight,
     prepare_run,
     print_run_header,
     resolve_path,
@@ -67,6 +68,7 @@ def main():
         "Integrated tokenize/cache + 4-bit QLoRA DeepSpeed benchmark."
     )
     cfg = load_model_config(resolve_path(args.config), args.model, qlora=True)
+    preflight(cfg, args, run_name_prefix="qlora_")
 
     # Builds TrainingArguments, so DeepSpeed (incl. ZeRO-3) is configured
     # before from_pretrained().

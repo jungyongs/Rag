@@ -29,7 +29,7 @@ dummy_data:
 # ---------------------------------------------------------------------
 defaults:
   # Data / tokenization cache
-  data_path: data/raw/dummy_1gb.txt
+  data_path: data/raw/data_out_step4_train_eos_v4.txt   # copied once from ~/shared
   file_pattern: "**/*.txt"
   # Files whose name contains any of these strings are left out of training
   # (e.g. 고객정보_T_샘플.xlsx.txt: names, resident numbers, addresses, phones).
@@ -50,9 +50,16 @@ defaults:
     - 위드팜&DRxSolution/건강보험심사평가원_의약품안전사용서비스(DUR) 의약품 목록_20260601
     - 위드팜&DRxSolution/한국의약품안전관리원_DUR_성분기준약물정보_20260721
   seq_len: 2048
+  # Split each file into documents at this literal string (it is removed
+  # from the text); each document then ends with the model's own EOS token
+  # and is shuffled on its own. null: one document per file.
+  document_separator: "<|endoftext|>"
   shuffle_documents: true
-  data_seed: 42
+  data_seed: 0             # document shuffle; keep fixed
   add_eos_between_documents: true
+  # Token added after each document. null: the tokenizer's eos_token. Set
+  # it per model when eos_token is a chat token (e.g. <|im_end|>).
+  document_end_token: null
   tokenize_chunk_chars: 1000000
   cache_wait_timeout_seconds: 86400
 
@@ -80,18 +87,37 @@ defaults:
   benchmark_warmup_steps: 20
   logging_steps: 10
   dataloader_num_workers: 4
-  seed: 42
+  seed: 0
 
-  # Checkpointing / resume (output_dir/<run>/checkpoint-<step>/)
+  # Checkpointing / resume (checkpoint_root/<output_dir>/<run>/checkpoint-<step>/)
   #   Full training state (weights or adapters + optimizer + scheduler +
   #   RNG + DeepSpeed shards) is saved, so a run that was cut off continues
   #   from the last complete checkpoint when launched again with the same
   #   command. Resuming needs the same GPU count (it is part of the run dir).
-  save_steps: 100          # save every N optimizer steps; 0 disables
-  save_interval_minutes: 30  # also save every N minutes; 0 disables
-  # Keep only the newest N checkpoints; 0 keeps all. With 1, the previous
-  # checkpoint is deleted right after the new one is completely written
-  # (never overwritten in place, so a shutdown mid-save cannot lose both).
+  # Local disk, not ~/shared. Relative output_dir values are placed here.
+  checkpoint_root: /home/shadeform/checkpoints
+  # Checkpoints at these points of the run are kept (never rotated) and are
+  # marked with MILESTONE.json; 100 is the end of training.
+  milestone_percents: [25, 50, 75, 100]
+  # true: every milestone saves only the bf16 weights (plain HF model /
+  # adapter in milestone-<pct>pct-step<N>/, for evaluation). The full
+  # training state (checkpoint-<step>/, for continuing training) is saved
+  # only at the end of training, or when a run is stopped. The 100%
+  # milestone doubles as the final model.
+  # false: milestones are full checkpoints and are all kept.
+  milestone_weights_only: true
+  # One fine-tuning at a time: a run does not start while checkpoint_root
+  # holds another run's checkpoints or a finished (100%) run. Copy the
+  # milestones off the machine, then clear them by hand with
+  # scripts/clear_checkpoints.py. Nothing deletes or starts runs on its own.
+  # Only the milestones are saved: no periodic saves in between. A stop
+  # (SIGTERM / Ctrl+C / --stop_at) still saves one resume checkpoint.
+  save_steps: 0            # save every N optimizer steps; 0 disables
+  save_interval_minutes: 0   # also save every N minutes; 0 disables
+  # Keep only the newest N non-milestone (resume) checkpoints; 0 keeps all.
+  # With 1, the previous one is deleted right after the new one is
+  # completely written (never overwritten in place, so a shutdown mid-save
+  # cannot lose both).
   save_total_limit: 1
   resume: true             # auto-resume (CLI: --no_resume / --resume_from_checkpoint)
 
@@ -159,7 +185,7 @@ models:
     model_path: models/AX-4.0
     quantized_model_path: models/AX-4.0-bnb-4bit
     cache_path: data/cache/ax4_72b_seq2048
-    output_dir: outputs/ax4_72b
+    output_dir: ax4_72b
     deepspeed_config: configs/deepspeed/zero3_cpu_offload.json
     stop_margin_minutes: 40   # ~1 TB full-FT checkpoint (bf16 weights + fp32 Adam)
     qlora:
@@ -171,16 +197,17 @@ models:
     model_path: models/AX-4.0-Light
     quantized_model_path: models/AX-4.0-Light-bnb-4bit
     cache_path: data/cache/ax4_light_7b_seq2048
-    output_dir: outputs/ax4_light_7b
+    output_dir: ax4_light_7b
     deepspeed_config: configs/deepspeed/zero2.json
-    micro_batch_size: 2
+    # Chat model: eos_token is <|im_end|>; documents end with <|endoftext|>.
+    document_end_token: "<|endoftext|>"
 
   qwen25_72b:
     repo_id: Qwen/Qwen2.5-72B
     model_path: models/Qwen2.5-72B
     quantized_model_path: models/Qwen2.5-72B-bnb-4bit
     cache_path: data/cache/qwen25_72b_seq2048
-    output_dir: outputs/qwen25_72b
+    output_dir: qwen25_72b
     deepspeed_config: configs/deepspeed/zero3_cpu_offload.json
     stop_margin_minutes: 40   # ~1 TB full-FT checkpoint (bf16 weights + fp32 Adam)
     qlora:
@@ -192,11 +219,9 @@ models:
     model_path: models/Qwen2.5-72B
     quantized_model_path: models/Qwen2.5-72B-bnb-4bit
     cache_path: data/cache/qwen25_72b_seq2048
-    output_dir: outputs/qwen25_72b_lora
+    output_dir: qwen25_72b_lora
     deepspeed_config: configs/deepspeed/zero3_lora.json
     training_mode: lora
-    attn_implementation: sdpa
-    seq_len: 32
     learning_rate: 1.0e-4
     weight_decay: 0.0
     lora_r: 16
@@ -217,7 +242,7 @@ models:
     model_path: models/Qwen3-8B-Base
     quantized_model_path: models/Qwen3-8B-Base-bnb-4bit
     cache_path: data/cache/qwen3_8b_seq2048
-    output_dir: outputs/qwen3_8b
+    output_dir: qwen3_8b
     deepspeed_config: configs/deepspeed/zero2.json
 
   apertus_70b:
@@ -225,7 +250,7 @@ models:
     model_path: models/Apertus-70B-MeditronFO
     quantized_model_path: models/Apertus-70B-MeditronFO-bnb-4bit
     cache_path: data/cache/apertus_70b_seq2048
-    output_dir: outputs/apertus_70b
+    output_dir: apertus_70b
     deepspeed_config: configs/deepspeed/zero3_cpu_offload.json
     stop_margin_minutes: 40   # ~1 TB full-FT checkpoint (bf16 weights + fp32 Adam)
     qlora:

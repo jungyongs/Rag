@@ -1,12 +1,15 @@
 import argparse
+import codecs
 import fnmatch
 import hashlib
 import json
+import math
 import os
 import random
 import shutil
 import signal
 import subprocess
+import sys
 import time
 import unicodedata
 from datetime import datetime
@@ -34,6 +37,8 @@ DEFAULT_CONFIG = PROJECT_ROOT / "config.yaml"
 
 # Written into checkpoint-<step>/ only after every rank finished saving it.
 CHECKPOINT_COMPLETE_MARKER = "_COMPLETE"
+# Written into milestone checkpoints (milestone_percents); never rotated.
+MILESTONE_FILE = "MILESTONE.json"
 
 
 def resolve_path(path_value: str) -> Path:
@@ -41,6 +46,14 @@ def resolve_path(path_value: str) -> Path:
     if not p.is_absolute():
         p = PROJECT_ROOT / p
     return p.resolve()
+
+
+def resolve_output_base(cfg) -> Path:
+    """output_dir, placed under checkpoint_root when it is relative."""
+    out = Path(cfg["output_dir"])
+    if cfg.get("checkpoint_root") and not out.is_absolute():
+        out = Path(cfg["checkpoint_root"]) / out
+    return resolve_path(str(out))
 
 
 def load_yaml(path: Path):
@@ -129,7 +142,9 @@ def discover_documents(input_path: Path, pattern: str, exclude_name_keywords=(),
     raise FileNotFoundError(f"Data path not found: {input_path}")
 
 
-def dataset_signature(files, model_path: Path, seq_len: int, add_eos: bool):
+def dataset_signature(files, model_path: Path, seq_len: int, add_eos: bool,
+                      separator=None, shuffle: bool = False, data_seed: int = 0,
+                      end_token=None):
     """
     Lightweight signature used only to detect obvious cache mismatches.
     It hashes paths, file sizes, mtimes, tokenizer/model path, and key settings.
@@ -139,6 +154,7 @@ def dataset_signature(files, model_path: Path, seq_len: int, add_eos: bool):
     h.update(str(model_path).encode())
     h.update(str(seq_len).encode())
     h.update(str(add_eos).encode())
+    h.update(repr((separator, shuffle, data_seed, end_token)).encode())
 
     for p in sorted(files):
         stat = p.stat()
@@ -149,52 +165,87 @@ def dataset_signature(files, model_path: Path, seq_len: int, add_eos: bool):
     return h.hexdigest()
 
 
-def iter_text_chunks(file_path: Path, chunk_chars: int):
+def find_documents(file_path: Path, separator, block_bytes: int = 64 << 20):
     """
-    Stream a large text file instead of reading a 1 GiB file into RAM.
-
-    Chunk boundaries are not treated as document boundaries and do not get EOS.
-    EOS is inserted only after the physical file/document ends.
+    Byte spans (start, end) of the documents in a file, split at the literal
+    `separator` (which is left out). Without a separator the whole file is
+    one document. Empty spans are skipped.
     """
-    buffer = []
-    char_count = 0
+    size = file_path.stat().st_size
+    if not separator:
+        return [(0, size)] if size else []
 
-    with file_path.open("r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            if len(line) > chunk_chars:
-                if buffer:
-                    yield "".join(buffer)
-                    buffer = []
-                    char_count = 0
+    sep = separator.encode("utf-8")
+    spans, doc_start, pos, tail = [], 0, 0, b""
+    with file_path.open("rb") as f:
+        while True:
+            block = f.read(block_bytes)
+            if not block:
+                break
+            data = tail + block
+            base = pos - len(tail)
+            i = 0
+            while True:
+                j = data.find(sep, i)
+                if j < 0:
+                    break
+                spans.append((doc_start, base + j))
+                doc_start = base + j + len(sep)
+                i = j + len(sep)
+            # Keep enough bytes to catch a separator split across blocks.
+            tail = data[max(i, len(data) - (len(sep) - 1)):]
+            pos += len(block)
+    spans.append((doc_start, size))
+    return [(a, b) for a, b in spans if b > a]
 
-                for start in range(0, len(line), chunk_chars):
-                    yield line[start:start + chunk_chars]
-                continue
 
-            buffer.append(line)
-            char_count += len(line)
+def iter_span_chunks(file_path: Path, start: int, end: int, chunk_chars: int):
+    """
+    Stream bytes [start, end) of a file as text pieces of about chunk_chars
+    bytes, cut at a line break where possible (never inside a character).
 
-            if char_count >= chunk_chars:
-                yield "".join(buffer)
-                buffer = []
-                char_count = 0
-
-    if buffer:
-        yield "".join(buffer)
+    Piece boundaries are not document boundaries and do not get EOS.
+    """
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    pending = ""
+    with file_path.open("rb") as f:
+        f.seek(start)
+        remaining = end - start
+        while remaining > 0:
+            block = f.read(min(chunk_chars, remaining))
+            if not block:
+                break
+            remaining -= len(block)
+            pending += decoder.decode(block, final=remaining == 0)
+            if remaining == 0:
+                break
+            cut = pending.rfind("\n") + 1
+            if cut == 0:
+                if len(pending) < chunk_chars:
+                    continue
+                cut = len(pending)  # one very long line
+            yield pending[:cut]
+            pending = pending[cut:]
+    pending += decoder.decode(b"", final=True)
+    if pending:
+        yield pending
 
 
 def packed_generator(
-    files,
+    documents,
     tokenizer,
     seq_len,
     add_eos_between_documents,
     chunk_chars,
+    eos_id=None,
 ):
     token_buffer = []
-    eos_id = tokenizer.eos_token_id
+    if eos_id is None:
+        eos_id = tokenizer.eos_token_id
 
-    for file_path in files:
-        for text_chunk in iter_text_chunks(file_path, chunk_chars):
+    for file_path, start, end in documents:
+        file_path = Path(file_path)
+        for text_chunk in iter_span_chunks(file_path, start, end, chunk_chars):
             if not text_chunk:
                 continue
 
@@ -241,7 +292,9 @@ def build_cache_if_needed(cfg, rank: int, rebuild_cache: bool):
     seq_len = int(cfg.get("seq_len", 2048))
     pattern = cfg.get("file_pattern", "**/*.txt")
     shuffle_documents = bool(cfg.get("shuffle_documents", True))
-    data_seed = int(cfg.get("data_seed", 42))
+    data_seed = int(cfg.get("data_seed", 0))
+    separator = cfg.get("document_separator") or None
+    end_token = cfg.get("document_end_token") or None
     add_eos = bool(cfg.get("add_eos_between_documents", True))
     chunk_chars = int(cfg.get("tokenize_chunk_chars", 1_000_000))
 
@@ -251,7 +304,10 @@ def build_cache_if_needed(cfg, rank: int, rebuild_cache: bool):
     if not files:
         raise RuntimeError(f"No .txt files found at: {data_path}")
 
-    signature = dataset_signature(files, model_path, seq_len, add_eos)
+    signature = dataset_signature(
+        files, model_path, seq_len, add_eos, separator, shuffle_documents, data_seed,
+        end_token,
+    )
 
     # Rank 0 decides whether the cache is valid and creates it.
     if rank == 0:
@@ -273,18 +329,25 @@ def build_cache_if_needed(cfg, rank: int, rebuild_cache: bool):
 
         cache_path.parent.mkdir(parents=True, exist_ok=True)
 
+        documents = [
+            (str(p), start, end)
+            for p in files
+            for start, end in find_documents(p, separator)
+        ]
         if shuffle_documents:
             rng = random.Random(data_seed)
-            rng.shuffle(files)
+            rng.shuffle(documents)
 
         print("\n" + "=" * 80)
         print("TOKENIZATION / PACKING (RANK 0 ONLY)")
         print("=" * 80)
         print(f"Tokenizer model : {model_path}")
         print(f"Raw data        : {data_path}")
-        print(f"Documents/files : {len(files):,}")
+        print(f"Files           : {len(files):,}")
+        print(f"Documents       : {len(documents):,} (separator {separator!r})")
+        print(f"Shuffle / seed  : {shuffle_documents} / {data_seed}")
         print(f"Seq length      : {seq_len}")
-        print(f"EOS per file    : {add_eos}")
+        print(f"EOS per document: {add_eos}")
         print(f"Cache           : {cache_path}")
         print("=" * 80)
 
@@ -295,16 +358,25 @@ def build_cache_if_needed(cfg, rank: int, rebuild_cache: bool):
             trust_remote_code=True,
         )
 
+        if end_token:
+            eos_id = tokenizer.convert_tokens_to_ids(end_token)
+            if eos_id is None or eos_id == tokenizer.unk_token_id:
+                raise ValueError(f"document_end_token {end_token!r} is not a token of {model_path}")
+        else:
+            eos_id = tokenizer.eos_token_id
+        print(f"Document end    : {tokenizer.convert_ids_to_tokens(eos_id)!r} (id {eos_id})")
+
         start = time.perf_counter()
 
         dataset = Dataset.from_generator(
             packed_generator,
             gen_kwargs={
-                "files": files,
+                "documents": documents,
                 "tokenizer": tokenizer,
                 "seq_len": seq_len,
                 "add_eos_between_documents": add_eos,
                 "chunk_chars": chunk_chars,
+                "eos_id": eos_id,
             },
         )
 
@@ -319,7 +391,8 @@ def build_cache_if_needed(cfg, rank: int, rebuild_cache: bool):
             "model_name": cfg["name"],
             "model_path": str(model_path),
             "raw_data_path": str(data_path),
-            "num_documents": len(files),
+            "num_files": len(files),
+            "num_documents": len(documents),
             "seq_len": seq_len,
             "num_sequences": num_sequences,
             "total_tokens": total_tokens,
@@ -461,13 +534,26 @@ class CheckpointCompleteMarker(TrainerCallback):
     the old one in place, so a shutdown mid-save always leaves one intact.
     """
 
-    def __init__(self, keep: int, data_state: dict):
+    def __init__(self, keep: int, data_state: dict, milestones=None,
+                 weights_only: bool = False, tokenizer_path: Path = None):
         self.keep = keep
         self.data_state = data_state
+        self.milestones = milestones
+        self.weights_only = weights_only
+        self.tokenizer_path = tokenizer_path
+        self.trainer = None  # set once the Trainer exists (weights export)
 
     def on_save(self, args, state, control, **kwargs):
         if dist.is_available() and dist.is_initialized():
             dist.barrier()
+
+        percent = self.milestones.steps.get(state.global_step) if self.milestones else None
+        if percent is not None and self.weights_only:
+            # Before _COMPLETE: if the export is cut off, this checkpoint is
+            # incomplete too, so the resume replays this step and exports again.
+            export_milestone_weights(
+                self.trainer, Path(args.output_dir), percent, self.tokenizer_path
+            )
 
         if not state.is_world_process_zero:
             return
@@ -493,16 +579,147 @@ class CheckpointCompleteMarker(TrainerCallback):
         with (checkpoint / DATA_STATE_FILE).open("w", encoding="utf-8") as f:
             json.dump(data_state, f, indent=2)
 
+        if percent is not None:
+            with (checkpoint / MILESTONE_FILE).open("w", encoding="utf-8") as f:
+                json.dump(
+                    {"percent": percent, "step": state.global_step,
+                     "max_steps": state.max_steps, "epoch": state.epoch},
+                    f, indent=2,
+                )
+
         (checkpoint / CHECKPOINT_COMPLETE_MARKER).write_text(
             "complete\n", encoding="utf-8"
         )
-        print(f"[CKPT] Saved: {checkpoint}")
+        if percent is not None and not self.weights_only:
+            print(f"[CKPT] Saved milestone {percent}%: {checkpoint}")
+        else:
+            print(f"[CKPT] Saved: {checkpoint}")
 
         if self.keep > 0:
-            others = [c for c in list_checkpoints(run_dir) if c != checkpoint]
+            # Full milestone checkpoints are kept; resume checkpoints (and,
+            # with weights-only milestones, every checkpoint-<step>) rotate.
+            others = [
+                c for c in list_checkpoints(run_dir)
+                if c != checkpoint
+                and (self.weights_only or milestone_percent(c) is None)
+            ]
             for old in others[: max(0, len(others) - (self.keep - 1))]:
                 print(f"[CKPT] Removing old checkpoint: {old}")
                 shutil.rmtree(old, ignore_errors=True)
+
+
+def milestone_percent(checkpoint: Path):
+    """Percent recorded in a complete milestone checkpoint, else None."""
+    path = checkpoint / MILESTONE_FILE
+    if not (path.exists() and (checkpoint / CHECKPOINT_COMPLETE_MARKER).exists()):
+        return None
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f).get("percent")
+
+
+class MilestoneSaver(TrainerCallback):
+    """
+    Save at each of milestone_percents of max_steps. With weights_only,
+    milestones before the last step export only the bf16 weights; the last
+    step also saves the full training state (checkpoint-<step>/).
+    """
+
+    def __init__(self, percents, weights_only: bool = False, tokenizer_path: Path = None):
+        self.percents = sorted({float(p) for p in percents or []})
+        self.steps = {}
+        self.weights_only = weights_only
+        self.tokenizer_path = tokenizer_path
+        self.trainer = None  # set once the Trainer exists (weights export)
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        # state.max_steps is final here (also when resuming).
+        self.steps = {}
+        for p in self.percents:
+            step = max(1, math.ceil(state.max_steps * p / 100))
+            self.steps[step] = int(p) if p.is_integer() else p
+        if state.is_world_process_zero and self.steps:
+            plan = ", ".join(f"{p}% @ step {s}" for s, p in sorted(self.steps.items()))
+            print(f"[CKPT] Milestones: {plan}")
+
+    def on_step_end(self, args, state, control, **kwargs):
+        percent = self.steps.get(state.global_step)
+        if percent is None:
+            return control
+        if self.weights_only and state.global_step < state.max_steps:
+            export_milestone_weights(
+                self.trainer, Path(args.output_dir), percent, self.tokenizer_path
+            )
+        else:
+            control.should_save = True
+        return control
+
+
+class CheckpointRootBusy(RuntimeError):
+    pass
+
+
+def check_checkpoint_root(cfg, run_dir: Path):
+    """
+    Allow a run only if checkpoint_root is empty of checkpoints, or holds
+    just this run's own unfinished checkpoints (resume). Never deletes
+    anything: clearing is done by hand with scripts/clear_checkpoints.py.
+    """
+    if not cfg.get("checkpoint_root"):
+        return
+    root = resolve_path(cfg["checkpoint_root"])
+    if not root.is_dir():
+        return
+
+    candidates = [
+        p for p in root.rglob("checkpoint-*")
+        if p.is_dir() and p.name.split("-", 1)[1].isdigit()
+    ]
+    candidates += [p for p in root.rglob("milestone-*") if p.is_dir()]
+
+    others, finished = [], []
+    for checkpoint in sorted(candidates):
+        if checkpoint.parent != run_dir:
+            others.append(checkpoint)
+        elif milestone_percent(checkpoint) == 100:
+            finished.append(checkpoint)
+
+    hint = (
+        "Copy the milestone checkpoints off this machine, then clear them by "
+        "hand with:\n  python scripts/clear_checkpoints.py"
+    )
+    if others:
+        listing = "\n".join(f"  {c}" for c in others)
+        raise CheckpointRootBusy(
+            f"Not starting: {root} holds checkpoints of another fine-tuning:\n"
+            f"{listing}\n{hint}"
+        )
+    if finished:
+        raise CheckpointRootBusy(
+            f"Not starting: this run already finished (100% milestone at "
+            f"{finished[-1]}).\n{hint}"
+        )
+
+
+def run_dir_for(cfg, args, run_name_prefix: str, world_size: int) -> Path:
+    attn_impl = (
+        args.attn_implementation
+        or cfg.get("attn_implementation", "flash_attention_2")
+    )
+    return resolve_output_base(cfg) / f"{run_name_prefix}{attn_impl}_{world_size}gpu"
+
+
+def preflight(cfg, args, run_name_prefix: str = ""):
+    """--preflight: run the checkpoint_root check without training, then exit."""
+    if not args.preflight:
+        return
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    try:
+        check_checkpoint_root(cfg, run_dir_for(cfg, args, run_name_prefix, world_size))
+    except CheckpointRootBusy as e:
+        print(f"[PREFLIGHT] {e}")
+        sys.exit(2)
+    print("[PREFLIGHT] OK")
+    sys.exit(0)
 
 
 def distributed_any(flags):
@@ -653,7 +870,8 @@ class CheckpointSync(TrainerCallback):
             print(f"[SYNC] WARNING: final rsync exited with code {returncode}")
 
 
-def export_final_model(trainer, final_dir: Path, tokenizer_path: Path):
+def export_final_model(trainer, final_dir: Path, tokenizer_path: Path,
+                       label: str = "[FINAL] Model saved"):
     """
     Save a plain HF model (full FT) or adapter (LoRA/QLoRA) to final_dir.
 
@@ -676,7 +894,38 @@ def export_final_model(trainer, final_dir: Path, tokenizer_path: Path):
             local_files_only=True,
             trust_remote_code=True,
         ).save_pretrained(str(final_dir))
-        print(f"[FINAL] Model saved: {final_dir}")
+        print(f"{label}: {final_dir}")
+
+
+def export_milestone_weights(trainer, run_dir: Path, percent, tokenizer_path: Path):
+    """
+    Weights-only milestone (plain HF model / adapter, for evaluation) in
+    run_dir/milestone-<pct>pct-step<N>/. Collective: call on every rank.
+    """
+    step = trainer.state.global_step
+    out = run_dir / f"milestone-{int(percent):03d}pct-step{step}"
+    if (out / CHECKPOINT_COMPLETE_MARKER).exists():
+        return  # already exported at this step (e.g. a stop save on a milestone)
+    if trainer.args.should_save and out.exists():
+        shutil.rmtree(out)  # left over from an export that was cut off
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+
+    export_final_model(
+        trainer, out, tokenizer_path,
+        label=f"[CKPT] Saved milestone {percent}% (weights only)",
+    )
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+
+    if trainer.args.should_save:
+        with (out / MILESTONE_FILE).open("w", encoding="utf-8") as f:
+            json.dump(
+                {"percent": percent, "step": step, "max_steps": trainer.state.max_steps,
+                 "epoch": trainer.state.epoch, "weights_only": True},
+                f, indent=2,
+            )
+        (out / CHECKPOINT_COMPLETE_MARKER).write_text("complete\n", encoding="utf-8")
 
 
 class SteadyStateTimer(TrainerCallback):
@@ -789,6 +1038,11 @@ def parse_args(description: str):
         help="Start from scratch even if config.yaml has resume: true.",
     )
     parser.add_argument(
+        "--preflight",
+        action="store_true",
+        help="Only check that checkpoint_root allows this run (exit 0/2).",
+    )
+    parser.add_argument(
         "--stop_at",
         default=None,
         help=(
@@ -829,7 +1083,7 @@ def prepare_run(cfg, args, run_name_prefix: str = ""):
     # --------------------------------------------------------------
     # 2. Training settings
     # --------------------------------------------------------------
-    output_base = resolve_path(cfg["output_dir"])
+    output_base = resolve_output_base(cfg)
 
     attn_impl = (
         args.attn_implementation
@@ -860,7 +1114,8 @@ def prepare_run(cfg, args, run_name_prefix: str = ""):
 
     set_seed(int(cfg.get("seed", 42)))
 
-    run_dir = output_base / f"{run_name_prefix}{attn_impl}_{world_size}gpu"
+    run_dir = run_dir_for(cfg, args, run_name_prefix, world_size)
+    check_checkpoint_root(cfg, run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
 
     # Checkpointing: optimizer/scheduler/RNG/DeepSpeed state is saved too,
@@ -873,7 +1128,7 @@ def prepare_run(cfg, args, run_name_prefix: str = ""):
         "dataset_signature": cache_metadata.get("signature"),
         "num_sequences": len(dataset),
         "shuffle_documents": bool(cfg.get("shuffle_documents", True)),
-        "data_seed": int(cfg.get("data_seed", 42)),
+        "data_seed": int(cfg.get("data_seed", 0)),
         "seed": int(cfg.get("seed", 42)),
         "world_size": world_size,
         "micro_batch_size": int(cfg.get("micro_batch_size", 1)),
@@ -1042,6 +1297,7 @@ def main():
         "Integrated tokenize/cache + BF16 (full / LoRA) DeepSpeed benchmark."
     )
     cfg = load_model_config(resolve_path(args.config), args.model)
+    preflight(cfg, args)
     run = prepare_run(cfg, args)
 
     model_path = resolve_path(cfg["model_path"])
@@ -1120,6 +1376,15 @@ def train_and_report(cfg, run, model, model_load_seconds: float, extra_metrics=N
     sync = CheckpointSync(
         cfg.get("checkpoint_sync_target"), run.output_base, run_dir, rank
     )
+    weights_only = bool(cfg.get("milestone_weights_only", False))
+    tokenizer_path = resolve_path(cfg["model_path"])
+    milestones = MilestoneSaver(
+        cfg.get("milestone_percents"), weights_only=weights_only, tokenizer_path=tokenizer_path
+    )
+    marker = CheckpointCompleteMarker(
+        run.save_total_limit, run.data_state, milestones,
+        weights_only=weights_only, tokenizer_path=tokenizer_path,
+    )
 
     trainer = Trainer(
         model=model,
@@ -1129,12 +1394,16 @@ def train_and_report(cfg, run, model, model_load_seconds: float, extra_metrics=N
         # Order matters: the marker (and old-checkpoint removal) must finish
         # before the timer measures the save and before the sync starts.
         callbacks=[
-            CheckpointCompleteMarker(run.save_total_limit, run.data_state),
+            milestones,
+            marker,
             timer,
             guard,
             sync,
         ],
     )
+
+    marker.trainer = trainer
+    milestones.trainer = trainer
 
     resume_checkpoint = run.resume_checkpoint
     train_result = trainer.train(
@@ -1209,8 +1478,13 @@ def train_and_report(cfg, run, model, model_load_seconds: float, extra_metrics=N
     # is continued from its checkpoint by re-running the same command.
     final_dir = None
     if guard.stop_reason is None and bool(cfg.get("export_final_model", True)):
-        final_dir = run_dir / "final"
-        export_final_model(trainer, final_dir, resolve_path(cfg["model_path"]))
+        # The 100% weights-only milestone already is the final model.
+        done = [p for p in run_dir.glob("milestone-100pct-step*") if milestone_percent(p) == 100]
+        if done:
+            final_dir = done[-1]
+        else:
+            final_dir = run_dir / "final"
+            export_final_model(trainer, final_dir, resolve_path(cfg["model_path"]))
 
     metrics = {
         "name": cfg["name"],
