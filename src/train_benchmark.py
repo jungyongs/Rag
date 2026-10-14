@@ -1,4 +1,5 @@
 import argparse
+import fnmatch
 import hashlib
 import json
 import os
@@ -85,23 +86,44 @@ def load_model_config(config_path: Path, model_key: str, qlora: bool = False):
     return cfg
 
 
-def discover_documents(input_path: Path, pattern: str, exclude_name_keywords=()):
+def path_matches_exclude(rel_parts, pattern_parts) -> bool:
+    """True if pattern_parts (fnmatch per component) appear as consecutive
+    components anywhere in rel_parts, i.e. the file is that path or below it."""
+    n = len(pattern_parts)
+    for off in range(len(rel_parts) - n + 1):
+        if all(fnmatch.fnmatchcase(rel_parts[off + i], pattern_parts[i]) for i in range(n)):
+            return True
+    return False
+
+
+def discover_documents(input_path: Path, pattern: str, exclude_name_keywords=(), exclude_paths=()):
     if input_path.is_file():
         return [input_path]
 
     if input_path.is_dir():
         # File names may be NFD (macOS origin), so compare in NFC.
         keywords = [unicodedata.normalize("NFC", k) for k in exclude_name_keywords]
-        files, excluded = [], []
+        path_patterns = [
+            [c for c in unicodedata.normalize("NFC", e).replace("\\", "/").split("/") if c]
+            for e in exclude_paths
+        ]
+        files, by_name, by_path = [], [], []
         for p in sorted(input_path.glob(pattern)):
             if not p.is_file():
                 continue
             name = unicodedata.normalize("NFC", p.name)
-            (excluded if any(k in name for k in keywords) else files).append(p)
-        if excluded:
-            print(f"[DATA] Excluded {len(excluded)} file(s) by name keyword {keywords}:")
-            for p in excluded:
-                print(f"[DATA]   - {unicodedata.normalize('NFC', str(p.relative_to(input_path)))}")
+            rel_parts = unicodedata.normalize("NFC", p.relative_to(input_path).as_posix()).split("/")
+            if any(k in name for k in keywords):
+                by_name.append(p)
+            elif any(path_matches_exclude(rel_parts, pp) for pp in path_patterns):
+                by_path.append(p)
+            else:
+                files.append(p)
+        for excluded, why in ((by_name, f"name keyword {keywords}"), (by_path, "exclude_paths")):
+            if excluded:
+                print(f"[DATA] Excluded {len(excluded)} file(s) by {why}:")
+                for p in excluded:
+                    print(f"[DATA]   - {unicodedata.normalize('NFC', str(p.relative_to(input_path)))}")
         return files
 
     raise FileNotFoundError(f"Data path not found: {input_path}")
@@ -224,7 +246,8 @@ def build_cache_if_needed(cfg, rank: int, rebuild_cache: bool):
     chunk_chars = int(cfg.get("tokenize_chunk_chars", 1_000_000))
 
     exclude_name_keywords = cfg.get("exclude_name_keywords") or []
-    files = discover_documents(data_path, pattern, exclude_name_keywords)
+    exclude_paths = cfg.get("exclude_paths") or []
+    files = discover_documents(data_path, pattern, exclude_name_keywords, exclude_paths)
     if not files:
         raise RuntimeError(f"No .txt files found at: {data_path}")
 

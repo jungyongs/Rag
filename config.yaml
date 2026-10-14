@@ -35,6 +35,20 @@ defaults:
   # (e.g. 고객정보_T_샘플.xlsx.txt: names, resident numbers, addresses, phones).
   exclude_name_keywords:
     - 고객정보
+  # Paths (relative to data_path, i.e. the preprocessed filtered/ tree) left
+  # out of training. A folder entry excludes everything below it. Each entry
+  # is matched component by component (fnmatch, NFC) as consecutive folders
+  # anywhere in the file's relative path. Zips were unpacked by the
+  # preprocessor into a folder named after the zip without ".zip".
+  exclude_paths:
+    - 위드팜&DRxSolution/처방전데이터샘플
+    - 위드팜&DRxSolution/디알엑스 상담 데이터/디알엑스내부_상담_샘플
+    - 위드팜&DRxSolution/바코드QR업체별_처방전_구조
+    - 위드팜&DRxSolution/내손안의약국_API_명세서_SAMPLE.pdf.txt
+    - 위드팜&DRxSolution/학습_데이터_수집/INDEX.md.txt
+    - 공공_약가*            # everything unpacked from the 공공_약가*.zip files
+    - 위드팜&DRxSolution/건강보험심사평가원_의약품안전사용서비스(DUR) 의약품 목록_20260601
+    - 위드팜&DRxSolution/한국의약품안전관리원_DUR_성분기준약물정보_20260721
   seq_len: 2048
   shuffle_documents: true
   data_seed: 42
