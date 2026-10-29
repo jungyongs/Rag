@@ -13,3 +13,8 @@ __pycache__/
 # Personal notes / code dumps (not part of the pipeline)
 /CV_answers.txt
 /all_code.txt
+
+# eval_items outputs
+/eval_items/judge_cache.jsonl
+/eval_items/results/
+__pycache__/
